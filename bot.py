@@ -11,8 +11,15 @@ from scraper import get_todays_menu
 
 load_dotenv()
 
-TOKEN: str = os.environ["DISCORD_TOKEN"]
-CHANNEL_ID: int = int(os.environ["CHANNEL_ID"])
+TOKEN: str = os.environ.get("DISCORD_TOKEN", "")
+CHANNEL_ID_STR: str = os.environ.get("CHANNEL_ID", "")
+
+if not TOKEN:
+    raise RuntimeError("Variable d'environnement DISCORD_TOKEN manquante.")
+if not CHANNEL_ID_STR:
+    raise RuntimeError("Variable d'environnement CHANNEL_ID manquante.")
+
+CHANNEL_ID: int = int(CHANNEL_ID_STR)
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
