@@ -1,19 +1,22 @@
+from datetime import date, timedelta
+
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup, NavigableString
 
 URL = "https://www.crous-lyon.fr/restaurant/restaurant-manufacture-des-tabacs/"
 
-
-# Catégories masquées en mode normal (affichées seulement en mode complet)
 _CATEGORIES_COMPLET_ONLY = {"entrée", "dessert"}
 
+_FRENCH_MONTHS = {
+    "janvier": 1, "février": 2, "mars": 3, "avril": 4,
+    "mai": 5, "juin": 6, "juillet": 7, "août": 8,
+    "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12,
+}
 
-async def get_todays_menu(complet: bool = False) -> str:
-    """Récupère et formate le menu du jour (Manufacture des Tabacs, Lyon 3).
 
-    Args:
-        complet: Si True, affiche toutes les catégories (entrées, desserts compris).
-    """
+async def get_menu(date_offset: int = 0, complet: bool = False) -> str:
+    """Récupère le menu pour le jour cible (date_offset=0 → aujourd'hui, 1 → demain…)."""
+    target = date.today() + timedelta(days=date_offset)
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -27,37 +30,62 @@ async def get_todays_menu(complet: bool = False) -> str:
             page = await context.new_page()
             await page.goto(URL, wait_until="networkidle", timeout=30000)
             try:
-                await page.wait_for_selector(".slick-current", timeout=10000)
+                await page.wait_for_selector(".slick-slide", timeout=10000)
             except Exception:
-                pass  # On continue même si le slider n'est pas encore initialisé
+                pass
             html = await page.content()
             await browser.close()
     except Exception as exc:
         return f"❌ Impossible de récupérer le menu : {exc}"
 
-    return _parse_menu(html, complet=complet)
+    return _parse_menu_for_date(html, target, complet=complet)
 
 
-def _parse_menu(html: str, complet: bool = False) -> str:
+def _parse_slide_date(text: str) -> date | None:
+    """Extrait une date depuis 'Menu du mercredi 11 mars 2026'."""
+    parts = text.lower().split()
+    for i, part in enumerate(parts):
+        if part.isdigit() and i + 2 < len(parts):
+            try:
+                day = int(part)
+                month = _FRENCH_MONTHS.get(parts[i + 1])
+                year = int(parts[i + 2])
+                if month:
+                    return date(year, month, day)
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def _parse_menu_for_date(html: str, target: date, complet: bool = False) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Le slide actif (.slick-current) correspond au menu du jour
-    slide = soup.find("div", class_="slick-current")
-    if not slide:
-        # Fallback : premier slide disponible
-        slide = soup.find("div", class_="slick-slide")
-    if not slide:
-        return "📭 Aucun menu disponible aujourd'hui (restaurant fermé ou page indisponible)."
+    target_slide = None
+    for slide in soup.find_all("div", class_="slick-slide"):
+        time_elem = slide.find("time", class_="menu_date_title")
+        if time_elem and _parse_slide_date(time_elem.get_text()) == target:
+            target_slide = slide
+            break
 
+    if not target_slide:
+        _DAYS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+        day_name = _DAYS_FR[target.weekday()]
+        return (
+            f"📭 Pas de menu disponible pour le **{day_name} {target.strftime('%d/%m/%Y')}** "
+            f"(restaurant fermé ou hors de la semaine en cours)."
+        )
+
+    return _parse_slide(target_slide, complet=complet)
+
+
+def _parse_slide(slide, complet: bool = False) -> str:
     lines: list[str] = []
 
-    # Date du menu
     date_elem = slide.find("time", class_="menu_date_title")
     if date_elem:
         lines.append(f"🍽️ **{date_elem.get_text(strip=True)}**")
         lines.append("━" * 38)
 
-    # Parcours des repas (Déjeuner, Dîner…)
     for meal in slide.find_all("div", class_="meal"):
         title_elem = meal.find("div", class_="meal_title")
         if title_elem:
@@ -68,13 +96,11 @@ def _parse_menu(html: str, complet: bool = False) -> str:
             continue
 
         for cat_li in foodies.find_all("li", recursive=False):
-            # Le nom de catégorie est le texte direct du <li> (pas dans un tag enfant)
             cat_name = "".join(
                 str(child) for child in cat_li.children
                 if isinstance(child, NavigableString)
             ).strip()
 
-            # Filtrage selon le mode
             if not complet and any(
                 cat_name.lower().startswith(excl) for excl in _CATEGORIES_COMPLET_ONLY
             ):
@@ -92,4 +118,4 @@ def _parse_menu(html: str, complet: bool = False) -> str:
         lines.append(
             "\n> ℹ️ Entrées et desserts masqués. Utilise `/menu mode:complet` pour tout voir."
         )
-    return "\n".join(lines) if lines else "📭 Aucun menu disponible aujourd'hui."
+    return "\n".join(lines) if lines else "📭 Aucun menu disponible."

@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from scraper import get_todays_menu
+from scraper import get_menu
 
 load_dotenv()
 
@@ -36,7 +36,7 @@ async def send_daily_menu() -> None:
         print(f"[ERREUR] Channel introuvable (id={CHANNEL_ID}). Vérifiez CHANNEL_ID dans .env")
         return
     print("📥 Récupération du menu du jour...")
-    menu = await get_todays_menu()
+    menu = await get_menu(date_offset=0)
     await _send_long_message(channel, menu)
     print("✅ Menu envoyé.")
 
@@ -61,7 +61,7 @@ async def on_ready() -> None:
 async def menu_prefix(ctx: commands.Context) -> None:
     """!menu — envoie immédiatement le menu du jour (commande préfixe)."""
     msg = await ctx.send("⏳ Récupération du menu en cours...")
-    menu = await get_todays_menu()
+    menu = await get_menu(date_offset=0)
     await msg.delete()
     await _send_long_message(ctx.channel, menu)
 
@@ -70,15 +70,24 @@ async def menu_prefix(ctx: commands.Context) -> None:
 @bot.tree.command(name="menu", description="Affiche le menu du jour — Manufacture des Tabacs (Lyon 3)")
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@discord.app_commands.describe(mode="Affichage : 'complet' pour voir aussi entrées et desserts")
+@discord.app_commands.describe(
+    jour="Quel jour ? (défaut : aujourd'hui)",
+    mode="Affichage : 'complet' pour voir aussi entrées et desserts",
+)
+@discord.app_commands.choices(jour=[
+    discord.app_commands.Choice(name="Aujourd'hui", value=0),
+    discord.app_commands.Choice(name="Demain", value=1),
+    discord.app_commands.Choice(name="Après-demain", value=2),
+])
 async def menu_slash(
     interaction: discord.Interaction,
+    jour: discord.app_commands.Choice[int] | None = None,
     mode: Literal["complet"] | None = None,
 ) -> None:
-    """Plats + accompagnements par défaut. Optionnel : mode complet."""
     complet = mode == "complet"
+    date_offset = jour.value if jour is not None else 0
     await interaction.response.defer(thinking=True)
-    menu = await get_todays_menu(complet=complet)
+    menu = await get_menu(date_offset=date_offset, complet=complet)
     chunks = _split_message(menu)
     await interaction.followup.send(chunks[0])
     for chunk in chunks[1:]:
@@ -99,6 +108,11 @@ async def help_slash(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="`/menu`",
         value="Affiche les **plats et accompagnements** du jour (entrées et desserts masqués).",
+        inline=False,
+    )
+    embed.add_field(
+        name="`/menu jour:Demain`** / **`jour:Après-demain`",
+        value="Affiche le menu d'un autre jour de la semaine en cours.",
         inline=False,
     )
     embed.add_field(
