@@ -83,7 +83,7 @@ THEMES: dict[str, dict] = {
     "motivation": {
         "mots": ["ganbatte", "ganbare", "ganbarimasu", "ganbarou", "faito", "ikuzo", "ikou", "yosh", "yoshi",
                  "yatta", "yattaa", "kanpai", "kampai", "plus ultra", "shinzou wo sasageyo", "dattebayo",
-                 "nakama", "makenai"],
+                 "nakama", "makenai", "hai", "hai hai", "ryoukai"],
         "gifs": ["thumbsup", "dance", "highfive", "happy"],
         "reponses": ["Ganbatte ! 💪", "Faito ! 🔥", "Yatta ! 🎉", "Kanpai ! 🍻", "Ikuzo ! ⚔️",
                      "Plus Ultra ! 💥", "Shinzou wo sasageyo ! 🫡"],
