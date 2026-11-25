@@ -98,6 +98,10 @@ class MenuCrous(commands.Bot):
         await self._config_initiale()
         await self.change_presence(activity=discord.Game("/menu · /aide"))
 
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        log.info("Ajouté au serveur %s (%s)", guild.name, guild.id)
+        await self._config_initiale()
+
     async def _config_initiale(self) -> None:
         """Premier démarrage : reprend MENU_CHANNEL_ID / NOTES_CHANNEL_ID de l'environnement."""
         s = self.settings
