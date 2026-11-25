@@ -93,7 +93,7 @@ def load_settings() -> Settings:
         insa_totp_secret=os.environ.get("INSA_TOTP_SECRET", "").strip(),
         notes_owner_id=_int("NOTES_OWNER_ID"),
         notes_url=os.environ.get(
-            "NOTES_URL", "https://mondossierweb.insa-lyon.fr/mondossierweb/notes"
+            "NOTES_URL", "https://mondossierweb.insa-lyon.fr/mondossierweb/inscriptions"
         ),
         notes_interval_min=_int("NOTES_INTERVAL_MIN", 30) or 30,
         web_port=_int("WEB_PORT", 8080) or 8080,
