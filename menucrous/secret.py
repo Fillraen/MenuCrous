@@ -116,9 +116,8 @@ DEFAUT = {
 }
 
 # Mots qui existent aussi en français / anglais : seulement s'ils sont seuls dans le message
-SEULS = {"uso", "dame", "matte", "itai", "nani", "baka", "souka", "hai", "ara", "domo", "aho", "moe", "nya",
-         "neko", "mochi", "udon", "soba", "ii ne", "sensei", "otaku", "ikou", "honto", "maji", "suki", "yaho",
-         "chibi", "weeb", "waifu", "desu", "kirei"}
+# (vrais faux amis seulement : « la dame », « je te hais/haï », « un ara », « peinture matte »…)
+SEULS = {"dame", "hai", "ara", "matte", "uso", "moe"}
 
 
 def _motif(mot: str) -> str:
@@ -209,6 +208,7 @@ async def sur_message(message: discord.Message) -> None:
     if not trouve:
         return
     mot, theme = trouve
+    log.info("Easter egg : « %s » (%s) dans #%s", mot, theme, getattr(message.channel, "name", "MP"))
     d = THEMES.get(theme, DEFAUT)
     texte = random.choice(d["reponses"])
     try:
