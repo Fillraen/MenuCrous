@@ -565,7 +565,8 @@ async def aide_cmd(inter: discord.Interaction) -> None:
         "`/config edt-semaine salon: heure: jour:` — image de la semaine (ex. lundi 7h30 ou dimanche 19h)\n"
         "`/config edt-jour salon: heure:` — cours du jour · `/config edt-modifs salon:` — cours modifiés\n"
         "`/config notes salon:` — annonces de nouvelles notes\n"
-        "`/config menu-stop` · `/config edt-stop quoi:` · `/config notes-stop`\n"
+        "`/config sws salon:` — rappels des signatures SoWeSign à faire des inscrits\n"
+        "`/config menu-stop` · `/config edt-stop quoi:` · `/config notes-stop` · `/config sws-stop`\n"
         "`/config voir` — toutes les configs du serveur · `/config test`"))
     if s.public_url:
         e.add_field(name="Sur le web", value=s.public_url, inline=False)
@@ -722,6 +723,36 @@ async def config_edt_stop(inter: discord.Interaction, quoi: app_commands.Choice[
         ("🛑 Arrêté : " + ", ".join(arretes)) if arretes else "Rien d'actif à arrêter.", ephemeral=True)
 
 
+@config_group.command(name="sws", description="Rappeler dans un salon les signatures SoWeSign à faire des inscrits")
+@app_commands.describe(salon="Salon des rappels (défaut : celui-ci)")
+async def config_sws(inter: discord.Interaction, salon: discord.TextChannel | None = None) -> None:
+    bot = _bot(inter)
+    if not bot.settings.sws_secret:
+        await inter.response.send_message("SoWeSign n'est pas activé sur ce bot (SWS_SECRET).", ephemeral=True)
+        return
+    ch = salon or inter.channel
+    perms = ch.permissions_for(inter.guild.me)
+    if not (perms.send_messages and perms.embed_links and perms.view_channel):
+        await inter.response.send_message(f"❌ Je n'ai pas le droit d'écrire (avec embeds) dans {ch.mention}.",
+                                          ephemeral=True)
+        return
+    await bot.db.set_sws_config(NotesConfig(inter.guild_id, ch.id, True))
+    await inter.response.send_message(
+        f"✅ Rappels SoWeSign dans {ch.mention} : quand un membre inscrit (`/sws inscription`) a une signature "
+        "à faire, je le mentionne avec les boutons. **Chaque bouton signe pour la personne qui clique.**\n"
+        "Les MP restent réglables par chacun : `/sws notifications`.", ephemeral=True)
+
+
+@config_group.command(name="sws-stop", description="Ne plus poster les rappels SoWeSign sur ce serveur")
+async def config_sws_stop(inter: discord.Interaction) -> None:
+    db = _bot(inter).db
+    cfg = await db.sws_config(inter.guild_id)
+    if cfg:
+        cfg.actif = False
+        await db.set_sws_config(cfg)
+    await inter.response.send_message("🛑 Rappels SoWeSign coupés sur ce serveur.", ephemeral=True)
+
+
 @config_group.command(name="notes", description="Annoncer les nouvelles notes (matière seulement) dans un salon")
 @app_commands.describe(salon="Salon des annonces (défaut : celui-ci)")
 async def config_notes(inter: discord.Interaction, salon: discord.TextChannel | None = None) -> None:
@@ -773,6 +804,10 @@ async def config_voir(inter: discord.Interaction) -> None:
     n = await bot.db.notes_config(gid)
     if n:
         lignes.append((n.actif, f"{etat(n.actif)} **🎓 Nouvelles notes** → <#{n.channel_id}> (matière seulement)"))
+    w = await bot.db.sws_config(gid)
+    if w:
+        lignes.append((w.actif, f"{etat(w.actif)} **✍️ Rappels SoWeSign** → <#{w.channel_id}> "
+                                f"(mention des inscrits qui ont une signature à faire)"))
 
     actives = [l for a, l in lignes if a]
     arretees = [l for a, l in lignes if not a]
@@ -786,12 +821,14 @@ async def config_voir(inter: discord.Interaction) -> None:
         ("`/config edt-jour`", await bot.db.edt_regle(gid, "jour") is not None),
         ("`/config edt-modifs`", await bot.db.edt_regle(gid, "modifs") is not None),
         ("`/config notes`", n is not None),
+        ("`/config sws`", w is not None or not bot.settings.sws_secret),
     ) if not ok]
     if manquantes:
         e.add_field(name="Pas encore configuré", value=" · ".join(manquantes), inline=False)
     sources = [
         f"Notes : {'relevé toutes les ' + str(bot.settings.notes_interval_min) + ' min (7h–23h)' if bot.settings.notes_enabled else 'désactivées (identifiants INSA absents)'}",
         f"EDT : {'lien ADE configuré' if bot.settings.edt_ics_url else 'désactivé (EDT_ICS_URL absent)'}",
+        f"SoWeSign : {'activé' if bot.settings.sws_secret else 'désactivé'}",
     ]
     e.set_footer(text=" · ".join(sources))
     await inter.response.send_message(embed=e, ephemeral=True)

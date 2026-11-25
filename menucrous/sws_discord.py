@@ -316,10 +316,27 @@ async def sws_desinscription(inter: discord.Interaction) -> None:
 
 
 # ── Surveillance (appelée par la boucle du bot) ─────────────────────────────────────────
+async def _salons_du_membre(bot: "MenuCrous", salons: list, user_id: int) -> list:
+    """Salons /config sws des serveurs dont l'utilisateur est membre."""
+    out = []
+    for cfg in salons:
+        guild = bot.get_guild(cfg.guild_id)
+        ch = bot.get_channel(cfg.channel_id)
+        if not guild or not ch:
+            continue
+        try:
+            await guild.fetch_member(user_id)
+        except discord.HTTPException:
+            continue
+        out.append(ch)
+    return out
+
+
 async def surveiller(bot: "MenuCrous") -> None:
     now = datetime.now(TZ)
+    salons = [c for c in await bot.db.sws_configs() if c.actif]
     for compte in await bot.db.sws_comptes():
-        if not compte.notif:
+        if not compte.notif and not salons:
             continue
         try:
             res = await client_de(bot, compte.user_id)
@@ -336,11 +353,19 @@ async def surveiller(bot: "MenuCrous") -> None:
         if nouveaux or rappel:
             titre = (f"🔔 Nouvelle signature à faire sur SoWeSign" if nouveaux else
                      f"⏰ Rappel : {len(items)} signature{'s' if len(items) > 1 else ''} en attente")
-            try:
-                user = await bot.fetch_user(compte.user_id)
-                await user.send(embed=embed_attente(items, titre), view=BoutonsSignature(items))
-            except discord.HTTPException as exc:
-                log.warning("MP SoWeSign impossible (%s) : %s", compte.user_id, exc)
+            if compte.notif:
+                try:
+                    user = await bot.fetch_user(compte.user_id)
+                    await user.send(embed=embed_attente(items, titre), view=BoutonsSignature(items))
+                except discord.HTTPException as exc:
+                    log.warning("MP SoWeSign impossible (%s) : %s", compte.user_id, exc)
+            for ch in await _salons_du_membre(bot, salons, compte.user_id):
+                try:
+                    await ch.send(content=f"<@{compte.user_id}>", embed=embed_attente(items, titre),
+                                  view=BoutonsSignature(items),
+                                  allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False))
+                except discord.HTTPException as exc:
+                    log.warning("Rappel SoWeSign dans #%s impossible : %s", getattr(ch, "name", ch.id), exc)
             if rappel:
                 compte.rappel = now.date().isoformat()
         if cles != compte.connus or rappel:

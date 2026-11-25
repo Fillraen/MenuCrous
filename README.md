@@ -68,6 +68,7 @@ personne qui l'utilise.
 | `/sws attente` | Ce qui est à signer (jetons posés par le formateur, rattrapages), boutons « Signer » / « Tout signer » |
 | `/sws code <code>` | Signe la séance ouverte en ce moment avec le code du formateur |
 | `/sws notifications`, `/sws statut`, `/sws signatures-effacer`, `/sws desinscription` | Réglages, suppression de tout |
+| `/config sws salon:` / `/config sws-stop` | (serveur) Rappels dans un salon : mention des membres inscrits qui ont une signature à faire, avec les boutons — chaque bouton signe pour la personne qui clique |
 
 Toutes les 20 min (7 h–22 h), le bot regarde ce qui est en attente et envoie un MP avec les
 boutons quand une nouvelle signature apparaît, plus un rappel le soir s'il en reste.

@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS sws_compte (
     rappel     TEXT,                         -- date ISO du dernier rappel quotidien
     cree       TEXT    NOT NULL
 );
+-- SoWeSign au niveau serveur : salon où rappeler aux membres inscrits leurs signatures à faire
+CREATE TABLE IF NOT EXISTS sws_config (
+    guild_id   INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    actif      INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS kv (
     cle    TEXT PRIMARY KEY,
     valeur TEXT NOT NULL
@@ -244,6 +250,23 @@ class Database:
             (c.user_id, self._chiffrer(c.code), c.nom,
              self._chiffrer(json.dumps(c.signatures)) if c.signatures else None,
              int(c.notif), json.dumps(c.connus), c.rappel, c.cree),
+        )
+        await self.conn.commit()
+
+    async def sws_configs(self) -> list[NotesConfig]:
+        async with self.conn.execute("SELECT * FROM sws_config") as cur:
+            return [NotesConfig(r["guild_id"], r["channel_id"], bool(r["actif"])) for r in await cur.fetchall()]
+
+    async def sws_config(self, guild_id: int) -> NotesConfig | None:
+        async with self.conn.execute("SELECT * FROM sws_config WHERE guild_id=?", (guild_id,)) as cur:
+            r = await cur.fetchone()
+        return NotesConfig(r["guild_id"], r["channel_id"], bool(r["actif"])) if r else None
+
+    async def set_sws_config(self, c: NotesConfig) -> None:
+        await self.conn.execute(
+            """INSERT INTO sws_config (guild_id, channel_id, actif) VALUES (?,?,?)
+               ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, actif=excluded.actif""",
+            (c.guild_id, c.channel_id, int(c.actif)),
         )
         await self.conn.commit()
 
