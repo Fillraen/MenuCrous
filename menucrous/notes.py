@@ -90,7 +90,20 @@ async def _login(page: Page, username: str, password: str, totp_secret: str = ""
         return
     except PWTimeout:
         pass
-    # Toujours sur le SSO : soit erreur d'identifiants, soit étape 2FA
+    # Toujours sur le SSO : erreur d'identifiants, ou étape 2FA. Keycloak propose d'abord la
+    # passkey (#authenticateWebAuthnButton) : impossible côté serveur → « Essayer une autre
+    # méthode » puis l'application d'authentification (TOTP).
+    if not await page.locator(_OTP_SEL).count() and await page.locator("#try-another-way").count():
+        await page.click("#try-another-way")
+        await page.wait_for_load_state("domcontentloaded")
+        choix = page.locator(
+            ".select-auth-box-parent, .pf-c-data-list__item, .pf-v5-c-data-list__item, "
+            "#kc-select-credential-form button, #kc-select-credential-form a"
+        ).filter(has_text=re.compile(r"authentif|OTP|code|application", re.I),
+                 has_not_text=re.compile(r"cl[ée] d.acc[eè]s|passkey|webauthn|s[ée]curit[ée]", re.I))
+        if await choix.count():
+            await choix.first.click()
+            await page.wait_for_load_state("domcontentloaded")
     if not await page.locator(_OTP_SEL).count():
         raise LoginError(await _erreur_page(page) or f"Connexion INSA bloquée sur {page.url}")
     consigne = _propre(await page.locator("form").first.inner_text())[:300]
