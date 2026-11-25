@@ -71,8 +71,10 @@ def heure_valide(h: str) -> str | None:
 
 class MenuCrous(commands.Bot):
     def __init__(self, settings: Settings):
-        super().__init__(command_prefix=commands.when_mentioned, intents=discord.Intents.default(),
-                         help_command=None)
+        intents = discord.Intents.default()
+        # Lire le texte des messages : intent privilégié, à cocher aussi dans le Developer Portal
+        intents.message_content = settings.secret_romaji
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
         self.settings = settings
         self.db = Database(settings.data_dir / "menucrous.db", settings.sws_secret)
         self.sws_clients: dict = {}  # user_id → SwsClient (session SoWeSign en mémoire)
@@ -122,6 +124,15 @@ class MenuCrous(commands.Bot):
         log.info("Connecté : %s (id=%s), %d serveur(s)", self.user, self.user.id, len(self.guilds))
         await self._config_initiale()
         await self.change_presence(activity=discord.Game("/menu · /aide"))
+
+    async def on_message(self, message: discord.Message) -> None:
+        if self.settings.secret_romaji:
+            from .secret import sur_message
+
+            try:
+                await sur_message(message)
+            except discord.HTTPException as exc:
+                log.debug("Easter egg : %s", exc)
 
     async def on_interaction(self, inter: discord.Interaction) -> None:
         """Boutons SoWeSign (custom_id « sws:… ») : traités ici pour marcher même après un
