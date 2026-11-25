@@ -175,7 +175,11 @@ def detecte(texte: str) -> tuple[str, str] | None:
         return mot, _MOT_THEME.get(_norme(mot), "taquin")
     for m in RE_MOTS.finditer(texte):
         mot = m.group(1).lower()
-        if _norme(mot) not in _SEULS_NORMES:
+        ambigu = _norme(mot) in _SEULS_NORMES
+        # Un mot ambigu compte aussi en pleine phrase s'il est étiré (« naaani ») ou crié (« nani ?! »)
+        etire = re.search(r"([aeiou])\1", re.sub(r"[\s\-_]", "", mot)) is not None
+        crie = re.match(r"\s*[!?]", texte[m.end():]) is not None
+        if not ambigu or etire or crie:
             return mot, _MOT_THEME.get(_norme(mot), "taquin")
     if (m := RE_ECRITURE.search(texte)):
         return m.group(0), "defaut"
