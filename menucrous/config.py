@@ -68,6 +68,8 @@ class Settings:
     notes_interval_min: int
     # Emploi du temps ADE (flux iCal personnel, le jeton est dans l'URL)
     edt_ics_url: str
+    # SoWeSign : clé Fernet de chiffrement des comptes (python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+    sws_secret: str
     # Petite page web publique (menu de la semaine + /health)
     web_port: int
     public_url: str
@@ -99,6 +101,7 @@ def load_settings() -> Settings:
         ),
         notes_interval_min=_int("NOTES_INTERVAL_MIN", 30) or 30,
         edt_ics_url=os.environ.get("EDT_ICS_URL", "").strip(),
+        sws_secret=os.environ.get("SWS_SECRET", "").strip(),
         web_port=_int("WEB_PORT", 8080) or 8080,
         public_url=os.environ.get("PUBLIC_URL", "").rstrip("/"),
     )

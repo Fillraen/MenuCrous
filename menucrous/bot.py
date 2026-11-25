@@ -74,7 +74,9 @@ class MenuCrous(commands.Bot):
         super().__init__(command_prefix=commands.when_mentioned, intents=discord.Intents.default(),
                          help_command=None)
         self.settings = settings
-        self.db = Database(settings.data_dir / "menucrous.db")
+        self.db = Database(settings.data_dir / "menucrous.db", settings.sws_secret)
+        self.sws_clients: dict = {}  # user_id → SwsClient (session SoWeSign en mémoire)
+        self.sws_jetons: dict = {}  # jeton de la page de dessin → (user_id, expiration)
         self.notes_etat: dict = {"dernier_passage": None, "erreur": None, "nb": 0}
         self.notes_lock = asyncio.Lock()
         # 2FA : code attendu du propriétaire (/notes code), et pause du relevé auto tant
@@ -90,11 +92,19 @@ class MenuCrous(commands.Bot):
         self.tree.add_command(config_group)
         self.tree.add_command(notes_group)
         self.tree.add_command(edt_group)
+        if self.settings.sws_secret:
+            from .sws_discord import sws_group
+
+            self.tree.add_command(sws_group)
         for cmd in (menu_cmd, semaine_cmd, restaurants_cmd, aide_cmd):
             self.tree.add_command(cmd)
         synced = await self.tree.sync()
         log.info("%d commandes slash synchronisées", len(synced))
         self.envoi_menus.start()
+        if self.settings.sws_secret:
+            self.surveille_sws.start()
+        else:
+            log.info("SWS_SECRET absent : SoWeSign désactivé")
         if self.settings.edt_ics_url:
             self.envoi_edt.start()
             self.surveille_edt.start()
@@ -112,6 +122,30 @@ class MenuCrous(commands.Bot):
         log.info("Connecté : %s (id=%s), %d serveur(s)", self.user, self.user.id, len(self.guilds))
         await self._config_initiale()
         await self.change_presence(activity=discord.Game("/menu · /aide"))
+
+    async def on_interaction(self, inter: discord.Interaction) -> None:
+        """Boutons SoWeSign (custom_id « sws:… ») : traités ici pour marcher même après un
+        redémarrage, sans vue persistante (les id contiennent la signature visée)."""
+        cid = str((inter.data or {}).get("custom_id", ""))
+        if inter.type == discord.InteractionType.component and cid.startswith("sws:"):
+            from .sws_discord import gerer_bouton
+
+            await gerer_bouton(inter)
+
+    @tasks.loop(minutes=20)
+    async def surveille_sws(self) -> None:
+        if not 7 <= maintenant().hour < 22:
+            return
+        from .sws_discord import surveiller
+
+        try:
+            await surveiller(self)
+        except Exception:
+            log.exception("Surveillance SoWeSign")
+
+    @surveille_sws.before_loop
+    async def _avant_sws(self) -> None:
+        await self.wait_until_ready()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         log.info("Ajouté au serveur %s (%s)", guild.name, guild.id)
@@ -520,6 +554,12 @@ async def aide_cmd(inter: discord.Interaction) -> None:
     e.add_field(name="Emploi du temps", inline=False, value=(
         "`/edt jour quand:` — cours d'aujourd'hui, demain ou d'un jour de la semaine\n"
         "`/edt semaine quand:` — cette semaine ou la suivante"))
+    if s.sws_secret:
+        e.add_field(name="SoWeSign (chacun pour soi)", inline=False, value=(
+            "`/sws inscription` — tes codes (privé, chiffrés) · `/sws signature` — ta signature\n"
+            "`/sws attente` — ce qui est à signer, boutons « Signer » / « Tout signer »\n"
+            "`/sws code` — signer la séance en cours avec le code du formateur\n"
+            "`/sws notifications` · `/sws statut` · `/sws desinscription`"))
     e.add_field(name="Réglages (gérer le serveur)", inline=False, value=(
         "`/config menu salon: heure: restaurants: complet:` — envoi automatique quotidien\n"
         "`/config edt-semaine salon: heure: jour:` — image de la semaine (ex. lundi 7h30 ou dimanche 19h)\n"

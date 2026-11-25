@@ -126,6 +126,10 @@ async def start_web(bot: "MenuCrous") -> None:
 
     app = web.Application()
     app.add_routes([web.get("/", page), web.get("/api/menu", api_menu), web.get("/health", health)])
+    if bot.settings.sws_secret:
+        from .sws_discord import routes
+
+        app.add_routes(routes(bot))
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", bot.settings.web_port).start()

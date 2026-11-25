@@ -56,6 +56,28 @@ pas de connexion à faire : **le jeton est dans l'URL, à garder secret**. Le fl
 comparés au relevé précédent (horaire, salle, intitulé) et les changements annoncés. Une
 semaine sans cours est affichée « période en entreprise ».
 
+## SoWeSign (émargement)
+
+Chacun ne signe **que pour soi** : toute commande ou tout bouton agit sur le compte de la
+personne qui l'utilise.
+
+| Commande | Effet |
+|---|---|
+| `/sws inscription` | Fenêtre privée : établissement, identifiant, PIN. Connexion testée, codes chiffrés en base (Fernet, `SWS_SECRET`) |
+| `/sws signature [photo]` | Ta signature : lien vers une page pour la dessiner (même cadre que SoWeSign) ou photo (stylo foncé, papier blanc). Jusqu'à 5, une prise au hasard à chaque fois |
+| `/sws attente` | Ce qui est à signer (jetons posés par le formateur, rattrapages), boutons « Signer » / « Tout signer » |
+| `/sws code <code>` | Signe la séance ouverte en ce moment avec le code du formateur |
+| `/sws notifications`, `/sws statut`, `/sws signatures-effacer`, `/sws desinscription` | Réglages, suppression de tout |
+
+Toutes les 20 min (7 h–22 h), le bot regarde ce qui est en attente et envoie un MP avec les
+boutons quand une nouvelle signature apparaît, plus un rappel le soir s'il en reste.
+
+Fonctionnement : le bot fait ce que fait l'appli web étudiante (`app.sowesign.com/student`) —
+connexion `JBAuth` par code, lecture de `presenttokens` / `recoveries`, signature PNG du cadre
+(trait noir, 3:2), corps chiffré comme l'appli (AES CryptoJS). Les constantes de chiffrement sont
+relues dans le JavaScript public de l'appli à chaque démarrage. Les cours avec un document à
+signer en plus ne sont pas gérés (à faire dans l'appli).
+
 ## Notes INSA
 
 Mon Dossier Web est une appli Vaadin derrière le SSO de l'INSA : le bot ouvre un Chromium

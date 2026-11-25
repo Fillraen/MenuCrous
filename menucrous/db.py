@@ -34,6 +34,17 @@ CREATE TABLE IF NOT EXISTS edt_regle (
     dernier_envoi TEXT,                   -- date ISO du dernier envoi auto
     PRIMARY KEY (guild_id, type)
 );
+-- SoWeSign : un compte par utilisateur Discord. Code et signatures chiffrés (Fernet, SWS_SECRET).
+CREATE TABLE IF NOT EXISTS sws_compte (
+    user_id    INTEGER PRIMARY KEY,
+    code       TEXT    NOT NULL,             -- chiffré : établissement + identifiant + PIN
+    nom        TEXT    NOT NULL DEFAULT '',
+    signatures TEXT,                         -- chiffré : liste JSON de data URL PNG
+    notif      INTEGER NOT NULL DEFAULT 1,   -- MP quand une signature est à faire
+    connus     TEXT    NOT NULL DEFAULT '[]',-- signatures en attente déjà notifiées
+    rappel     TEXT,                         -- date ISO du dernier rappel quotidien
+    cree       TEXT    NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
     cle    TEXT PRIMARY KEY,
     valeur TEXT NOT NULL
@@ -64,6 +75,18 @@ class EdtRegle:
 
 
 @dataclass
+class SwsCompte:
+    user_id: int
+    code: str  # en clair en mémoire uniquement
+    nom: str
+    signatures: list[str]
+    notif: bool
+    connus: list[str]
+    rappel: str | None
+    cree: str
+
+
+@dataclass
 class NotesConfig:
     guild_id: int
     channel_id: int
@@ -71,9 +94,14 @@ class NotesConfig:
 
 
 class Database:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, secret: str = ""):
         self.path = path
         self.conn: aiosqlite.Connection | None = None
+        self.fernet = None
+        if secret:
+            from cryptography.fernet import Fernet
+
+            self.fernet = Fernet(secret.encode())
 
     async def open(self) -> None:
         self.conn = await aiosqlite.connect(self.path)
@@ -181,6 +209,46 @@ class Database:
                  jour_semaine=excluded.jour_semaine, actif=excluded.actif, dernier_envoi=excluded.dernier_envoi""",
             (c.guild_id, c.type, c.channel_id, c.heure, c.jour_semaine, int(c.actif), c.dernier_envoi),
         )
+        await self.conn.commit()
+
+    # ── SoWeSign ─────────────────────────────────────────────────────────────
+    def _chiffrer(self, texte: str) -> str:
+        if not self.fernet:
+            raise RuntimeError("SWS_SECRET absent : impossible de stocker des identifiants")
+        return self.fernet.encrypt(texte.encode()).decode()
+
+    def _dechiffrer(self, texte: str | None) -> str | None:
+        return self.fernet.decrypt(texte.encode()).decode() if texte else None
+
+    def _sws(self, r) -> SwsCompte:
+        sigs = self._dechiffrer(r["signatures"])
+        return SwsCompte(r["user_id"], self._dechiffrer(r["code"]), r["nom"], json.loads(sigs) if sigs else [],
+                         bool(r["notif"]), json.loads(r["connus"]), r["rappel"], r["cree"])
+
+    async def sws_comptes(self) -> list[SwsCompte]:
+        async with self.conn.execute("SELECT * FROM sws_compte") as cur:
+            return [self._sws(r) for r in await cur.fetchall()]
+
+    async def sws_compte(self, user_id: int) -> SwsCompte | None:
+        async with self.conn.execute("SELECT * FROM sws_compte WHERE user_id=?", (user_id,)) as cur:
+            r = await cur.fetchone()
+        return self._sws(r) if r else None
+
+    async def set_sws_compte(self, c: SwsCompte) -> None:
+        await self.conn.execute(
+            """INSERT INTO sws_compte (user_id, code, nom, signatures, notif, connus, rappel, cree)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET code=excluded.code, nom=excluded.nom,
+                 signatures=excluded.signatures, notif=excluded.notif, connus=excluded.connus,
+                 rappel=excluded.rappel""",
+            (c.user_id, self._chiffrer(c.code), c.nom,
+             self._chiffrer(json.dumps(c.signatures)) if c.signatures else None,
+             int(c.notif), json.dumps(c.connus), c.rappel, c.cree),
+        )
+        await self.conn.commit()
+
+    async def del_sws_compte(self, user_id: int) -> None:
+        await self.conn.execute("DELETE FROM sws_compte WHERE user_id=?", (user_id,))
         await self.conn.commit()
 
     # ── Clé / valeur (instantané des notes, etc.) ─────────────────────────────
