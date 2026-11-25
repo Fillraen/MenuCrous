@@ -236,6 +236,7 @@ class MenuCrous(commands.Bot):
         if not nouvelles:
             return
         embed = notes_embed(notes_mod.matieres(nouvelles))
+        log.info("Nouvelle(s) note(s) : %d ligne(s), %d matière(s)", len(nouvelles), len(notes_mod.matieres(nouvelles)))
         envoye = False
         for cfg in await self.db.notes_configs():
             if not cfg.actif or cfg.channel_id == sauf_salon:
@@ -248,6 +249,7 @@ class MenuCrous(commands.Bot):
         if not envoye and sauf_salon is None and self.settings.notes_owner_id:
             try:
                 await (await self.fetch_user(self.settings.notes_owner_id)).send(embed=embed)
+                log.info("Annonce envoyée en MP au propriétaire")
             except discord.HTTPException as exc:
                 log.warning("MP au propriétaire impossible : %s", exc)
 
