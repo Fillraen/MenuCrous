@@ -82,6 +82,7 @@ class MenuCrous(commands.Bot):
     # ── Démarrage ─────────────────────────────────────────────────────────────
     async def setup_hook(self) -> None:
         await self.db.open()
+        self.add_view(DetailNotes())  # bouton « Détail » des anciens messages, après redémarrage
         self.tree.add_command(config_group)
         self.tree.add_command(notes_group)
         for cmd in (menu_cmd, semaine_cmd, restaurants_cmd, aide_cmd):
@@ -205,6 +206,7 @@ class MenuCrous(commands.Bot):
             avant = await self.db.get_json("notes_snapshot")
             nouvelles = notes_mod.diff(avant or {}, toutes) if avant is not None else []
             await self.db.set_json("notes_snapshot", notes_mod.instantane(toutes))
+            await self.db.set_json("notes_resume", notes_mod.resume(toutes))
             self.notes_etat.update(erreur=None, dernier_passage=maintenant().isoformat(),
                                    nb=sum(n.publiee and n.detail for n in toutes))
             if avant is None:
@@ -235,7 +237,8 @@ class MenuCrous(commands.Bot):
         """Annonce les matières qui ont une nouvelle note. Jamais la note elle-même."""
         if not nouvelles:
             return
-        embed = notes_embed(notes_mod.matieres(nouvelles))
+        res = await self.db.get_json("notes_resume", [])
+        embed = notes_embed(notes_mod.matieres(nouvelles), res)
         log.info("Nouvelle(s) note(s) : %d ligne(s), %d matière(s)", len(nouvelles), len(notes_mod.matieres(nouvelles)))
         envoye = False
         for cfg in await self.db.notes_configs():
@@ -243,12 +246,12 @@ class MenuCrous(commands.Bot):
                 continue
             ch = self.get_channel(cfg.channel_id)
             if ch:
-                await ch.send(embed=embed)
+                await ch.send(embed=embed, view=DetailNotes(res))
                 envoye = True
         # Aucun salon configuré : MP au propriétaire, pour ne pas rater l'info
         if not envoye and sauf_salon is None and self.settings.notes_owner_id:
             try:
-                await (await self.fetch_user(self.settings.notes_owner_id)).send(embed=embed)
+                await (await self.fetch_user(self.settings.notes_owner_id)).send(embed=embed, view=DetailNotes(res))
                 log.info("Annonce envoyée en MP au propriétaire")
             except discord.HTTPException as exc:
                 log.warning("MP au propriétaire impossible : %s", exc)
@@ -270,13 +273,66 @@ class MenuCrous(commands.Bot):
         await self.wait_until_ready()
 
 
-def notes_embed(matieres: list[str]) -> discord.Embed:
+MDW_URL = "https://mondossierweb.insa-lyon.fr/mondossierweb/inscriptions"
+
+
+def ajouter_recap(e: discord.Embed, res: list[dict]) -> discord.Embed:
+    """Une ligne par année : nombre de notes publiées / attendues (jamais les notes)."""
+    for annee, (pub, tot) in notes_mod.compte_par_annee(res).items():
+        barre = "▰" * round(10 * pub / tot) + "▱" * (10 - round(10 * pub / tot)) if tot else ""
+        e.add_field(name=f"🎓 {annee}", value=f"**{pub}** note{'s' if pub > 1 else ''} / {tot}\n{barre}", inline=True)
+    return e
+
+
+def notes_embed(matieres: list[str], res: list[dict]) -> discord.Embed:
     desc = "\n".join(f"• **{m}**" for m in matieres)
-    return discord.Embed(
-        title="📢 Nouvelle note sur Mon Dossier Web", color=0x9B59B6,
-        url="https://mondossierweb.insa-lyon.fr/mondossierweb/inscriptions",
+    e = discord.Embed(
+        title="📢 Nouvelle note sur Mon Dossier Web", color=0x9B59B6, url=MDW_URL,
         description=desc if len(desc) <= 4000 else desc[:3990] + "\n…",
     ).set_footer(text="Parcours → Notes et résultats")
+    return ajouter_recap(e, res)
+
+
+def detail_embed(res: list[dict]) -> discord.Embed:
+    """Matières de l'année la plus récente : ✅ note(s) dispo / ▫️ en attente."""
+    if not res:
+        return discord.Embed(description="Pas encore de relevé des notes.", color=0x9B59B6)
+    annee = res[0]["annee"]  # Mon Dossier Web liste l'année la plus récente en premier
+    pub, tot = notes_mod.compte_par_annee(res).get(annee, (0, 0))
+    e = discord.Embed(title=f"🎓 {annee} — {pub} note{'s' if pub > 1 else ''} sur {tot}", color=0x9B59B6,
+                      url=MDW_URL, description="✅ note disponible · ▫️ pas encore de note")
+    for semestre, matieres in notes_mod.detail_annee(res, annee).items():
+        lignes = []
+        for mat, p, t in matieres:
+            icone = "✅" if p else "▫️"
+            compte = f" ({p}/{t})" if t > 1 else ""
+            lignes.append(f"{icone} {mat}{compte}")
+        # Découpe en plusieurs champs si besoin (1024 caractères max par champ)
+        bloc, n = [], 0
+        for l in lignes:
+            if sum(len(x) + 1 for x in bloc) + len(l) > 1000:
+                e.add_field(name=semestre + (" (suite)" if n else ""), value="\n".join(bloc), inline=False)
+                bloc, n = [], n + 1
+            bloc.append(l)
+        if bloc:
+            e.add_field(name=semestre + (" (suite)" if n else ""), value="\n".join(bloc), inline=False)
+    return e.set_footer(text="Les notes elles-mêmes ne sont jamais affichées")
+
+
+class DetailNotes(discord.ui.View):
+    """Bouton « Détail » sous les messages de notes. Persistant : ``custom_id`` fixe et vue
+    enregistrée au démarrage (add_view), il marche encore après un redémarrage du bot."""
+
+    def __init__(self, res: list[dict] | None = None):
+        super().__init__(timeout=None)
+        if res:
+            self.detail.label = f"Détail {res[0]['annee']}"
+
+    @discord.ui.button(label="Détail de l'année", emoji="📋", style=discord.ButtonStyle.secondary,
+                       custom_id="menucrous:notes-detail")
+    async def detail(self, inter: discord.Interaction, _button: discord.ui.Button) -> None:
+        res = await _bot(inter).db.get_json("notes_resume", [])
+        await inter.response.send_message(embed=detail_embed(res), ephemeral=True)
 
 
 def _bot(inter: discord.Interaction) -> MenuCrous:
@@ -501,10 +557,12 @@ async def notes_verifier(inter: discord.Interaction) -> None:
     except Exception as exc:
         await inter.followup.send(f"❌ Relevé impossible : {str(exc)[:300]}")
         return
+    res = await bot.db.get_json("notes_resume", [])
     if not nouvelles:
-        await inter.followup.send("🤷 Aucune nouvelle note depuis le dernier relevé.")
+        e = discord.Embed(title="🤷 Aucune nouvelle note depuis le dernier relevé", color=0x9B59B6, url=MDW_URL)
+        await inter.followup.send(embed=ajouter_recap(e, res), view=DetailNotes(res))
         return
-    await inter.followup.send(embed=notes_embed(notes_mod.matieres(nouvelles)))
+    await inter.followup.send(embed=notes_embed(notes_mod.matieres(nouvelles), res), view=DetailNotes(res))
     # Annonce aussi dans les salons configurés (ce relevé a « consommé » les nouveautés)
     await bot.annoncer_notes(nouvelles, sauf_salon=inter.channel_id or 0)
 
@@ -523,10 +581,10 @@ async def notes_statut(inter: discord.Interaction) -> None:
     nxt = bot.surveille_notes.next_iteration
     if nxt:
         e.add_field(name="Prochain", value=f"<t:{int(nxt.timestamp())}:R>")
-    e.add_field(name="Notes publiées", value=str(et["nb"]))
     if et["erreur"]:
         e.add_field(name="⚠️ Dernière erreur", value=et["erreur"][:1000], inline=False)
-    await inter.response.send_message(embed=e, ephemeral=True)
+    res = await bot.db.get_json("notes_resume", [])
+    await inter.response.send_message(embed=ajouter_recap(e, res), view=DetailNotes(res), ephemeral=True)
 
 
 @notes_group.command(name="code", description="Donner le code 2FA INSA demandé en MP (propriétaire)")

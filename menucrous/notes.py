@@ -54,6 +54,8 @@ class Note:
     epreuve: str  # « Evaluation Terminale »… vide si la ligne est la matière / l'UE
     valeur: str  # « 13.95/20 », « VALIDE » (période entreprise…), "" = pas encore publiée
     resultat: str = ""  # VALIDE, NON VALIDE, AJ…
+    semestre: str = ""
+    finale: bool = True  # pas de ligne-fille : épreuve, ou matière sans épreuves
 
     @property
     def publiee(self) -> bool:
@@ -214,8 +216,43 @@ def lignes_vers_notes(rows: list[dict]) -> list[Note]:
         else:
             matiere, epreuve = libelle, ""
         valeur, resultat = _valeur(" ".join(cells[1:]))
-        notes.append(Note(_cle(*chemin), annee, niveau, ue, matiere, epreuve, valeur, resultat))
+        semestre = chemin[NIV_SEMESTRE] if niveau > NIV_SEMESTRE else ""
+        if notes and niveau > notes[-1].niveau:
+            notes[-1].finale = False  # la ligne précédente a des enfants
+        notes.append(Note(_cle(*chemin), annee, niveau, ue, matiere, epreuve, valeur, resultat, semestre))
     return notes
+
+
+def resume(notes: list[Note]) -> list[dict]:
+    """Vue anonyme des matières/épreuves (sans aucune note) pour les récapitulatifs.
+    L'ordre est celui de Mon Dossier Web : la première année est la plus récente."""
+    return [
+        {"annee": n.annee, "semestre": n.semestre, "matiere": n.matiere, "epreuve": n.epreuve,
+         "finale": n.finale, "publiee": n.publiee}
+        for n in notes if n.detail
+    ]
+
+
+def compte_par_annee(res: list[dict]) -> dict[str, tuple[int, int]]:
+    """{année: (notes publiées, notes attendues)}, en ne comptant que les lignes finales."""
+    out: dict[str, tuple[int, int]] = {}
+    for r in res:
+        if r["finale"]:
+            pub, tot = out.get(r["annee"], (0, 0))
+            out[r["annee"]] = (pub + r["publiee"], tot + 1)
+    return out
+
+
+def detail_annee(res: list[dict], annee: str) -> dict[str, list[tuple[str, int, int]]]:
+    """{semestre: [(matière, notes publiées, notes attendues)]} pour une année."""
+    par_sem: dict[str, dict[str, list[int]]] = {}
+    for r in res:
+        if r["annee"] != annee or not r["finale"]:
+            continue
+        m = par_sem.setdefault(r["semestre"] or "Année", {}).setdefault(r["matiere"], [0, 0])
+        m[0] += r["publiee"]
+        m[1] += 1
+    return {s: [(mat, p, t) for mat, (p, t) in mats.items()] for s, mats in par_sem.items()}
 
 
 async def _lire_inscriptions(page: Page) -> list[Note]:
