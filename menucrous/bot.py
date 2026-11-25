@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
 import time
@@ -12,11 +13,12 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from . import edt as edt_mod
+from . import edt_image
 from . import menu as menus
 from . import notes as notes_mod
 from .config import RESTAURANTS, TZ, Settings
-from .db import Database, EdtConfig, MenuConfig, NotesConfig
-from .format import (edt_changements_embed, edt_jour_embed, edt_semaine_embed, ferme_embed, jour_fr,
+from .db import Database, EdtRegle, MenuConfig, NotesConfig
+from .format import (JOURS, edt_changements_embed, edt_jour_embed, edt_semaine_embed, ferme_embed, jour_fr,
                      menu_embed)
 
 log = logging.getLogger("menucrous")
@@ -199,15 +201,32 @@ class MenuCrous(commands.Bot):
                 log.warning("Salon %s introuvable", cid)
         return ch
 
-    async def poster_edt(self, cfg: EdtConfig, quoi: str, d: date) -> bool:
-        """quoi = "semaine" (semaine contenant d) ou "jour". Renvoie False si rien posté."""
-        ch = await self._salon(cfg.channel_id)
+    def semaine_visee(self, regle: EdtRegle, d: date) -> date:
+        """Envoi « semaine » le week-end (samedi/dimanche) : c'est la semaine suivante qui compte."""
+        return d + timedelta(days=7 - d.weekday()) if d.weekday() >= 5 else d
+
+    async def message_semaine(self, d: date) -> tuple[discord.Embed, discord.File | None]:
+        """Embed + image de la grille pour la semaine contenant d."""
+        cours = await edt_mod.get_cours(self.settings.edt_ics_url)
+        jours = edt_mod.de_la_semaine(cours, d)
+        embed = edt_semaine_embed(jours)
+        if not any(jours.values()):
+            return embed, None  # semaine en entreprise : pas de grille vide
+        png = await asyncio.to_thread(edt_image.rendre_semaine, jours, maintenant().date())
+        embed.clear_fields()  # la grille remplace la liste jour par jour
+        embed.set_image(url="attachment://edt.png")
+        return embed, discord.File(io.BytesIO(png), filename="edt.png")
+
+    async def poster_edt(self, regle: EdtRegle, d: date) -> bool:
+        """Poste la règle (semaine ou jour) pour la date d. Renvoie False si rien posté."""
+        ch = await self._salon(regle.channel_id)
         if ch is None:
             return False
-        cours = await edt_mod.get_cours(self.settings.edt_ics_url)
-        if quoi == "semaine":
-            await ch.send(embed=edt_semaine_embed(edt_mod.de_la_semaine(cours, d)))
+        if regle.type == "semaine":
+            embed, fichier = await self.message_semaine(self.semaine_visee(regle, d))
+            await ch.send(embed=embed, **({"file": fichier} if fichier else {}))
             return True
+        cours = await edt_mod.get_cours(self.settings.edt_ics_url)
         du_jour = edt_mod.du_jour(cours, d)
         if not du_jour:
             return False  # pas de cours : rien à poster
@@ -218,28 +237,22 @@ class MenuCrous(commands.Bot):
     async def envoi_edt(self) -> None:
         now = maintenant()
         today = now.date()
-        lundi_iso = edt_mod.lundi(today).isoformat()
-        for cfg in await self.db.edt_configs():
-            if not cfg.actif:
+        for r in await self.db.edt_regles():
+            if not r.actif or r.type == "modifs" or r.dernier_envoi == today.isoformat():
                 continue
-            h, m = map(int, cfg.heure.split(":"))
+            if r.type == "semaine" and today.weekday() != r.jour_semaine:
+                continue
+            h, m = map(int, r.heure.split(":"))
             prevu = now.replace(hour=h, minute=m, second=0, microsecond=0)
             if not (prevu <= now < prevu + RATTRAPAGE):
                 continue
             try:
-                if (cfg.mode in ("semaine", "les2") and today.weekday() == 0
-                        and cfg.derniere_semaine != lundi_iso):
-                    await self.poster_edt(cfg, "semaine", today)
-                    cfg.derniere_semaine = lundi_iso
-                    await self.db.set_edt_config(cfg)
-                if cfg.mode in ("jour", "les2") and cfg.dernier_jour != today.isoformat():
-                    # « les2 » le lundi : le récap de la semaine suffit
-                    if not (cfg.mode == "les2" and today.weekday() == 0):
-                        await self.poster_edt(cfg, "jour", today)
-                    cfg.dernier_jour = today.isoformat()
-                    await self.db.set_edt_config(cfg)
+                await self.poster_edt(r, today)
             except Exception:
-                log.exception("Envoi auto de l'EDT (serveur %s)", cfg.guild_id)
+                log.exception("Envoi auto de l'EDT %s (serveur %s)", r.type, r.guild_id)
+                continue  # retenté la minute suivante
+            r.dernier_envoi = today.isoformat()
+            await self.db.set_edt_regle(r)
 
     @tasks.loop(minutes=30)
     async def surveille_edt(self) -> None:
@@ -263,8 +276,8 @@ class MenuCrous(commands.Bot):
             return
         log.info("EDT : %d changement(s)", len(chg))
         embed = edt_changements_embed(chg)
-        for cfg in await self.db.edt_configs():
-            if cfg.actif and cfg.modifs and (ch := await self._salon(cfg.channel_id)):
+        for r in await self.db.edt_regles():
+            if r.type == "modifs" and r.actif and (ch := await self._salon(r.channel_id)):
                 await ch.send(embed=embed)
 
     @envoi_edt.before_loop
@@ -509,10 +522,11 @@ async def aide_cmd(inter: discord.Interaction) -> None:
         "`/edt semaine quand:` — cette semaine ou la suivante"))
     e.add_field(name="Réglages (gérer le serveur)", inline=False, value=(
         "`/config menu salon: heure: restaurants: complet:` — envoi automatique quotidien\n"
-        "`/config edt salon: mode: heure: modifs:` — EDT de la semaine (lundi) et/ou du jour\n"
+        "`/config edt-semaine salon: heure: jour:` — image de la semaine (ex. lundi 7h30 ou dimanche 19h)\n"
+        "`/config edt-jour salon: heure:` — cours du jour · `/config edt-modifs salon:` — cours modifiés\n"
         "`/config notes salon:` — annonces de nouvelles notes\n"
-        "`/config menu-stop` · `/config edt-stop` · `/config notes-stop`\n"
-        "`/config voir` · `/config test`"))
+        "`/config menu-stop` · `/config edt-stop quoi:` · `/config notes-stop`\n"
+        "`/config voir` — toutes les configs du serveur · `/config test`"))
     if s.public_url:
         e.add_field(name="Sur le web", value=s.public_url, inline=False)
     e.set_footer(text="Sources : crous-lyon.fr, secours CROUStillant · Hébergé sur le homelab")
@@ -573,60 +587,99 @@ async def config_menu_stop(inter: discord.Interaction) -> None:
     await inter.response.send_message("🛑 Envoi automatique du menu arrêté.", ephemeral=True)
 
 
-MODES_EDT = {"semaine": "semaine le lundi", "jour": "chaque jour de cours", "les2": "semaine le lundi + chaque jour"}
+JOURS_CHOIX = [app_commands.Choice(name=j.capitalize(), value=i)
+               for i, j in enumerate(["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"])]
+TYPES_EDT = {"semaine": "📆 EDT de la semaine (image)", "jour": "📅 EDT du jour", "modifs": "📌 Modifications d'EDT"}
 
 
-@config_group.command(name="edt", description="Envoi automatique de l'emploi du temps dans un salon")
-@app_commands.describe(salon="Salon où poster (défaut : celui-ci)",
-                       mode="Récap de la semaine le lundi, cours du jour chaque matin, ou les deux",
-                       heure="Heure d'envoi, ex. 07:30 (heure de Paris)",
-                       modifs="Annoncer les cours déplacés / ajoutés / annulés (14 prochains jours)")
-@app_commands.choices(mode=[
-    app_commands.Choice(name="Semaine (le lundi)", value="semaine"),
-    app_commands.Choice(name="Jour (chaque matin de cours)", value="jour"),
-    app_commands.Choice(name="Les deux", value="les2"),
-])
-async def config_edt(inter: discord.Interaction, salon: discord.TextChannel | None = None,
-                     mode: app_commands.Choice[str] | None = None, heure: str | None = None,
-                     modifs: bool | None = None) -> None:
+async def _verifier_salon(inter: discord.Interaction, salon: discord.TextChannel | None):
+    """Salon cible (défaut : celui de la commande) si le bot peut y écrire, sinon None (réponse envoyée)."""
+    ch = salon or inter.channel
+    perms = ch.permissions_for(inter.guild.me)
+    if not (perms.send_messages and perms.embed_links and perms.attach_files and perms.view_channel):
+        await inter.response.send_message(
+            f"❌ Il me faut voir, écrire, intégrer des liens et joindre des fichiers dans {ch.mention}.", ephemeral=True)
+        return None
+    return ch
+
+
+async def _regle_edt(inter: discord.Interaction, type_: str, salon, heure: str | None, defaut_h: str,
+                     jour_semaine: int | None = None) -> EdtRegle | None:
     bot = _bot(inter)
     if not bot.settings.edt_ics_url:
         await inter.response.send_message("❌ Pas de lien ADE (`EDT_ICS_URL`) sur le serveur.", ephemeral=True)
-        return
-    ancien = await bot.db.edt_config(inter.guild_id)
-    h = heure_valide(heure) if heure else (ancien.heure if ancien else "07:30")
+        return None
+    ancien = await bot.db.edt_regle(inter.guild_id, type_)
+    h = heure_valide(heure) if heure else (ancien.heure if ancien else defaut_h)
     if h is None:
-        await inter.response.send_message("❌ Heure invalide. Exemples : `07:30`, `7h`, `8h15`.", ephemeral=True)
-        return
-    ch = salon or inter.channel
-    perms = ch.permissions_for(inter.guild.me)
-    if not (perms.send_messages and perms.embed_links and perms.view_channel):
-        await inter.response.send_message(f"❌ Je n'ai pas le droit d'écrire (avec embeds) dans {ch.mention}.",
-                                          ephemeral=True)
-        return
-    cfg = EdtConfig(
-        inter.guild_id, ch.id, mode.value if mode else (ancien.mode if ancien else "semaine"), h,
-        modifs if modifs is not None else (ancien.modifs if ancien else True), True,
-        # Pas d'envoi immédiat si l'heure est déjà passée et que c'était déjà envoyé
-        ancien.dernier_jour if ancien else None, ancien.derniere_semaine if ancien else None,
+        await inter.response.send_message("❌ Heure invalide. Exemples : `07:30`, `7h`, `19h`.", ephemeral=True)
+        return None
+    ch = await _verifier_salon(inter, salon)
+    if ch is None:
+        return None
+    regle = EdtRegle(
+        inter.guild_id, type_, ch.id, h,
+        jour_semaine if jour_semaine is not None else (ancien.jour_semaine if ancien else 0),
+        True, ancien.dernier_envoi if ancien else None,
     )
-    await bot.db.set_edt_config(cfg)
-    await inter.response.send_message(
-        f"✅ Emploi du temps dans {ch.mention} : **{MODES_EDT[cfg.mode]}** à **{cfg.heure}**"
-        f"{', + alertes de modifications' if cfg.modifs else ''}. Rien n'est posté les jours sans cours.\n"
-        f"Aperçu tout de suite : `/edt semaine` ou `/edt jour`.", ephemeral=True)
+    await bot.db.set_edt_regle(regle)
+    return regle
 
 
-@config_group.command(name="edt-stop", description="Arrêter l'envoi automatique de l'emploi du temps")
-async def config_edt_stop(inter: discord.Interaction) -> None:
+@config_group.command(name="edt-semaine", description="Image de l'emploi du temps de la semaine, une fois par semaine")
+@app_commands.describe(salon="Salon où poster (défaut : celui-ci)", heure="Heure d'envoi, ex. 07:30 ou 19h",
+                       jour="Jour d'envoi (samedi/dimanche = la semaine qui arrive)")
+@app_commands.choices(jour=JOURS_CHOIX)
+async def config_edt_semaine(inter: discord.Interaction, salon: discord.TextChannel | None = None,
+                             heure: str | None = None, jour: app_commands.Choice[int] | None = None) -> None:
+    r = await _regle_edt(inter, "semaine", salon, heure, "07:30", jour.value if jour else None)
+    if r:
+        quand = JOURS[r.jour_semaine]
+        quelle = "la semaine suivante" if r.jour_semaine >= 5 else "la semaine en cours"
+        await inter.response.send_message(
+            f"✅ {TYPES_EDT['semaine']} dans <#{r.channel_id}> chaque **{quand} à {r.heure}** ({quelle}).\n"
+            "Aperçu : `/edt semaine`. Tout voir : `/config voir`.", ephemeral=True)
+
+
+@config_group.command(name="edt-jour", description="Cours du jour, chaque matin où il y a cours")
+@app_commands.describe(salon="Salon où poster (défaut : celui-ci)", heure="Heure d'envoi, ex. 07:30")
+async def config_edt_jour(inter: discord.Interaction, salon: discord.TextChannel | None = None,
+                          heure: str | None = None) -> None:
+    r = await _regle_edt(inter, "jour", salon, heure, "07:30")
+    if r:
+        await inter.response.send_message(
+            f"✅ {TYPES_EDT['jour']} dans <#{r.channel_id}> à **{r.heure}**, les jours où il y a cours.\n"
+            "Aperçu : `/edt jour`. Tout voir : `/config voir`.", ephemeral=True)
+
+
+@config_group.command(name="edt-modifs", description="Annoncer les cours déplacés / ajoutés / annulés (14 prochains jours)")
+@app_commands.describe(salon="Salon où poster (défaut : celui-ci)")
+async def config_edt_modifs(inter: discord.Interaction, salon: discord.TextChannel | None = None) -> None:
+    r = await _regle_edt(inter, "modifs", salon, None, "07:30")
+    if r:
+        await inter.response.send_message(
+            f"✅ {TYPES_EDT['modifs']} annoncées dans <#{r.channel_id}> (vérification toutes les 30 min, 7h–23h).",
+            ephemeral=True)
+
+
+@config_group.command(name="edt-stop", description="Arrêter un envoi automatique de l'emploi du temps")
+@app_commands.describe(quoi="Lequel arrêter")
+@app_commands.choices(quoi=[
+    app_commands.Choice(name="EDT de la semaine", value="semaine"),
+    app_commands.Choice(name="EDT du jour", value="jour"),
+    app_commands.Choice(name="Modifications", value="modifs"),
+    app_commands.Choice(name="Tout l'EDT", value="tout"),
+])
+async def config_edt_stop(inter: discord.Interaction, quoi: app_commands.Choice[str]) -> None:
     db = _bot(inter).db
-    cfg = await db.edt_config(inter.guild_id)
-    if not cfg or not cfg.actif:
-        await inter.response.send_message("L'envoi de l'emploi du temps n'est pas activé ici.", ephemeral=True)
-        return
-    cfg.actif = False
-    await db.set_edt_config(cfg)
-    await inter.response.send_message("🛑 Envoi automatique de l'emploi du temps arrêté.", ephemeral=True)
+    arretes = []
+    for r in await db.edt_regles(inter.guild_id):
+        if r.actif and quoi.value in (r.type, "tout"):
+            r.actif = False
+            await db.set_edt_regle(r)
+            arretes.append(TYPES_EDT[r.type])
+    await inter.response.send_message(
+        ("🛑 Arrêté : " + ", ".join(arretes)) if arretes else "Rien d'actif à arrêter.", ephemeral=True)
 
 
 @config_group.command(name="notes", description="Annoncer les nouvelles notes (matière seulement) dans un salon")
@@ -651,25 +704,56 @@ async def config_notes_stop(inter: discord.Interaction) -> None:
     await inter.response.send_message("🛑 Annonces de notes coupées sur ce serveur.", ephemeral=True)
 
 
-@config_group.command(name="voir", description="Afficher les réglages de ce serveur")
+@config_group.command(name="voir", description="Toutes les configs de ce serveur (actives et arrêtées)")
 async def config_voir(inter: discord.Interaction) -> None:
     bot = _bot(inter)
-    m = await bot.db.menu_config(inter.guild_id)
-    n = await bot.db.notes_config(inter.guild_id)
-    e = discord.Embed(title="⚙️ Réglages MenuCrous", color=0x95A5A6)
-    e.add_field(name="Menu automatique", inline=False, value=(
-        f"{'✅' if m.actif else '🛑'} <#{m.channel_id}> à **{m.heure}** — "
-        f"{', '.join(RESTAURANTS[k].nom for k in m.restaurants if k in RESTAURANTS)}"
-        f"{' (complet)' if m.complet else ''}\nDernier envoi : {m.dernier_envoi or 'jamais'}") if m else "Non configuré")
-    e.add_field(name="Annonces de notes", inline=False,
-                value=f"{'✅' if n.actif else '🛑'} <#{n.channel_id}>" if n else "Non configuré")
-    e.add_field(name="Relevé des notes", inline=False, value=(
-        f"Toutes les {bot.settings.notes_interval_min} min (7h–23h)" if bot.settings.notes_enabled
-        else "Désactivé (identifiants INSA absents)"))
-    t = await bot.db.edt_config(inter.guild_id)
-    e.add_field(name="Emploi du temps", inline=False, value=(
-        f"{'✅' if t.actif else '🛑'} <#{t.channel_id}> — {MODES_EDT[t.mode]} à **{t.heure}**"
-        f"{' · modifications annoncées' if t.modifs else ''}") if t else "Non configuré")
+    gid = inter.guild_id
+
+    def etat(actif: bool) -> str:
+        return "🟢" if actif else "⚫"
+
+    def dernier(d: str | None) -> str:
+        return f" · dernier envoi {date.fromisoformat(d).strftime('%d/%m')}" if d else ""
+
+    lignes: list[tuple[bool, str]] = []
+    m = await bot.db.menu_config(gid)
+    if m:
+        lignes.append((m.actif, f"{etat(m.actif)} **🍴 Menu CROUS** → <#{m.channel_id}> chaque jour à **{m.heure}**\n"
+                       f"　{', '.join(RESTAURANTS[k].nom for k in m.restaurants if k in RESTAURANTS)}"
+                       f"{' · complet' if m.complet else ''}{dernier(m.dernier_envoi)}"))
+    for r in sorted(await bot.db.edt_regles(gid), key=lambda r: list(TYPES_EDT).index(r.type)):
+        if r.type == "semaine":
+            quand = f"chaque **{JOURS[r.jour_semaine]} à {r.heure}**" + (" (semaine suivante)" if r.jour_semaine >= 5 else "")
+        elif r.type == "jour":
+            quand = f"à **{r.heure}** les jours de cours"
+        else:
+            quand = "dès qu'un cours change (14 prochains jours)"
+        lignes.append((r.actif, f"{etat(r.actif)} **{TYPES_EDT[r.type]}** → <#{r.channel_id}> {quand}"
+                       f"{dernier(r.dernier_envoi) if r.type != 'modifs' else ''}"))
+    n = await bot.db.notes_config(gid)
+    if n:
+        lignes.append((n.actif, f"{etat(n.actif)} **🎓 Nouvelles notes** → <#{n.channel_id}> (matière seulement)"))
+
+    actives = [l for a, l in lignes if a]
+    arretees = [l for a, l in lignes if not a]
+    e = discord.Embed(title=f"⚙️ Configs de {inter.guild.name}", color=0x95A5A6,
+                      description="\n\n".join(actives) if actives else "Aucune config active.")
+    if arretees:
+        e.add_field(name="Arrêtées", value="\n".join(arretees)[:1024], inline=False)
+    manquantes = [nom for nom, ok in (
+        ("`/config menu`", m is not None),
+        ("`/config edt-semaine`", await bot.db.edt_regle(gid, "semaine") is not None),
+        ("`/config edt-jour`", await bot.db.edt_regle(gid, "jour") is not None),
+        ("`/config edt-modifs`", await bot.db.edt_regle(gid, "modifs") is not None),
+        ("`/config notes`", n is not None),
+    ) if not ok]
+    if manquantes:
+        e.add_field(name="Pas encore configuré", value=" · ".join(manquantes), inline=False)
+    sources = [
+        f"Notes : {'relevé toutes les ' + str(bot.settings.notes_interval_min) + ' min (7h–23h)' if bot.settings.notes_enabled else 'désactivées (identifiants INSA absents)'}",
+        f"EDT : {'lien ADE configuré' if bot.settings.edt_ics_url else 'désactivé (EDT_ICS_URL absent)'}",
+    ]
+    e.set_footer(text=" · ".join(sources))
     await inter.response.send_message(embed=e, ephemeral=True)
 
 
@@ -726,14 +810,14 @@ async def edt_jour(inter: discord.Interaction, quand: app_commands.Choice[str] |
 ])
 async def edt_semaine(inter: discord.Interaction, quand: app_commands.Choice[str] | None = None) -> None:
     await inter.response.defer(thinking=True)
-    cours = await _cours_ou_erreur(inter)
-    if cours is None:
+    if await _cours_ou_erreur(inter) is None:
         return
     d = maintenant().date()
     if quand is None and d.weekday() >= 5:
         d += timedelta(days=2)  # le week-end, « cette semaine » = celle qui arrive
     d += timedelta(weeks=int(quand.value) if quand else 0)
-    await inter.followup.send(embed=edt_semaine_embed(edt_mod.de_la_semaine(cours, d)))
+    embed, fichier = await _bot(inter).message_semaine(d)
+    await inter.followup.send(embed=embed, **({"file": fichier} if fichier else {}))
 
 
 # ── /notes ────────────────────────────────────────────────────────────────────

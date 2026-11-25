@@ -22,15 +22,17 @@ CREATE TABLE IF NOT EXISTS notes_config (
     channel_id INTEGER NOT NULL,
     actif      INTEGER NOT NULL DEFAULT 1
 );
-CREATE TABLE IF NOT EXISTS edt_config (
-    guild_id   INTEGER PRIMARY KEY,
-    channel_id INTEGER NOT NULL,
-    mode       TEXT    NOT NULL DEFAULT 'semaine',   -- semaine | jour | les2
-    heure      TEXT    NOT NULL DEFAULT '07:30',
-    modifs     INTEGER NOT NULL DEFAULT 1,           -- annoncer les cours déplacés/ajoutés/annulés
-    actif      INTEGER NOT NULL DEFAULT 1,
-    dernier_jour     TEXT,                           -- date ISO du dernier envoi « jour »
-    derniere_semaine TEXT                            -- lundi ISO du dernier envoi « semaine »
+-- Emploi du temps : plusieurs règles indépendantes par serveur (une par type), chacune
+-- avec son salon et son heure.
+CREATE TABLE IF NOT EXISTS edt_regle (
+    guild_id     INTEGER NOT NULL,
+    type         TEXT    NOT NULL,        -- semaine | jour | modifs
+    channel_id   INTEGER NOT NULL,
+    heure        TEXT    NOT NULL DEFAULT '07:30',
+    jour_semaine INTEGER NOT NULL DEFAULT 0,  -- « semaine » : 0 = lundi … 6 = dimanche
+    actif        INTEGER NOT NULL DEFAULT 1,
+    dernier_envoi TEXT,                   -- date ISO du dernier envoi auto
+    PRIMARY KEY (guild_id, type)
 );
 CREATE TABLE IF NOT EXISTS kv (
     cle    TEXT PRIMARY KEY,
@@ -51,15 +53,14 @@ class MenuConfig:
 
 
 @dataclass
-class EdtConfig:
+class EdtRegle:
     guild_id: int
+    type: str  # semaine | jour | modifs
     channel_id: int
-    mode: str
-    heure: str
-    modifs: bool
-    actif: bool
-    dernier_jour: str | None
-    derniere_semaine: str | None
+    heure: str = "07:30"
+    jour_semaine: int = 0
+    actif: bool = True
+    dernier_envoi: str | None = None
 
 
 @dataclass
@@ -78,7 +79,26 @@ class Database:
         self.conn = await aiosqlite.connect(self.path)
         self.conn.row_factory = aiosqlite.Row
         await self.conn.executescript(SCHEMA)
+        await self._migrer_edt()
         await self.conn.commit()
+
+    async def _migrer_edt(self) -> None:
+        """Ancienne table edt_config (une règle « mode » par serveur) → edt_regle."""
+        async with self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='edt_config'") as cur:
+            if not await cur.fetchone():
+                return
+        async with self.conn.execute("SELECT * FROM edt_config") as cur:
+            anciens = await cur.fetchall()
+        for r in anciens:
+            types = {"semaine": ["semaine"], "jour": ["jour"], "les2": ["semaine", "jour"]}[r["mode"]]
+            if r["modifs"]:
+                types.append("modifs")
+            for t in types:
+                await self.conn.execute(
+                    "INSERT OR IGNORE INTO edt_regle (guild_id, type, channel_id, heure, actif) VALUES (?,?,?,?,?)",
+                    (r["guild_id"], t, r["channel_id"], r["heure"], r["actif"]))
+        await self.conn.execute("DROP TABLE edt_config")
 
     async def close(self) -> None:
         if self.conn:
@@ -138,28 +158,28 @@ class Database:
 
     # ── Emploi du temps ───────────────────────────────────────────────────────
     @staticmethod
-    def _edt(r) -> EdtConfig:
-        return EdtConfig(r["guild_id"], r["channel_id"], r["mode"], r["heure"], bool(r["modifs"]),
-                         bool(r["actif"]), r["dernier_jour"], r["derniere_semaine"])
+    def _regle(r) -> EdtRegle:
+        return EdtRegle(r["guild_id"], r["type"], r["channel_id"], r["heure"], r["jour_semaine"],
+                        bool(r["actif"]), r["dernier_envoi"])
 
-    async def edt_configs(self) -> list[EdtConfig]:
-        async with self.conn.execute("SELECT * FROM edt_config") as cur:
-            return [self._edt(r) for r in await cur.fetchall()]
+    async def edt_regles(self, guild_id: int | None = None) -> list[EdtRegle]:
+        sql, args = ("SELECT * FROM edt_regle", ()) if guild_id is None else (
+            "SELECT * FROM edt_regle WHERE guild_id=?", (guild_id,))
+        async with self.conn.execute(sql, args) as cur:
+            return [self._regle(r) for r in await cur.fetchall()]
 
-    async def edt_config(self, guild_id: int) -> EdtConfig | None:
-        async with self.conn.execute("SELECT * FROM edt_config WHERE guild_id=?", (guild_id,)) as cur:
+    async def edt_regle(self, guild_id: int, type_: str) -> EdtRegle | None:
+        async with self.conn.execute("SELECT * FROM edt_regle WHERE guild_id=? AND type=?", (guild_id, type_)) as cur:
             r = await cur.fetchone()
-        return self._edt(r) if r else None
+        return self._regle(r) if r else None
 
-    async def set_edt_config(self, c: EdtConfig) -> None:
+    async def set_edt_regle(self, c: EdtRegle) -> None:
         await self.conn.execute(
-            """INSERT INTO edt_config (guild_id, channel_id, mode, heure, modifs, actif, dernier_jour, derniere_semaine)
-               VALUES (?,?,?,?,?,?,?,?)
-               ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, mode=excluded.mode,
-                 heure=excluded.heure, modifs=excluded.modifs, actif=excluded.actif,
-                 dernier_jour=excluded.dernier_jour, derniere_semaine=excluded.derniere_semaine""",
-            (c.guild_id, c.channel_id, c.mode, c.heure, int(c.modifs), int(c.actif), c.dernier_jour,
-             c.derniere_semaine),
+            """INSERT INTO edt_regle (guild_id, type, channel_id, heure, jour_semaine, actif, dernier_envoi)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(guild_id, type) DO UPDATE SET channel_id=excluded.channel_id, heure=excluded.heure,
+                 jour_semaine=excluded.jour_semaine, actif=excluded.actif, dernier_envoi=excluded.dernier_envoi""",
+            (c.guild_id, c.type, c.channel_id, c.heure, c.jour_semaine, int(c.actif), c.dernier_envoi),
         )
         await self.conn.commit()
 

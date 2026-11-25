@@ -13,7 +13,7 @@ COPY requirements.txt .
 # Chromium « headless shell » (plus léger que le Chromium complet) + ses dépendances système,
 # pour lire Mon Dossier Web (appli Vaadin, rendue en JavaScript).
 # libatomic1 : requis par le Node embarqué de Playwright, absent de l'image slim.
-RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 fonts-dejavu-core \
  && pip install -r requirements.txt \
  && playwright install --with-deps --only-shell chromium \
  && rm -rf /var/lib/apt/lists/*

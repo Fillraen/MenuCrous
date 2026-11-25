@@ -32,9 +32,12 @@ les desserts sous « Plat végétarien »).
 | `/semaine [restaurant]` | partout | Les plats des prochains jours |
 | `/restaurants` | partout | Adresse, horaires, accès |
 | `/edt jour [quand]` | partout | Cours d'un jour (aujourd'hui, demain, un jour de la semaine) |
-| `/edt semaine [quand]` | partout | Cette semaine, la suivante ou dans 2 semaines |
-| `/config edt salon: mode: heure: modifs:` | serveur | EDT auto : `semaine` (le lundi), `jour` (chaque matin de cours) ou les deux ; `modifs` = alertes de changements |
-| `/config edt-stop` | serveur | Coupe l'EDT auto |
+| `/edt semaine [quand]` | partout | **Image** de la semaine (grille lundi → vendredi), cette semaine, la suivante ou dans 2 semaines |
+| `/config edt-semaine salon: heure: jour:` | serveur | Image de la semaine, un jour par semaine (samedi/dimanche = semaine suivante) |
+| `/config edt-jour salon: heure:` | serveur | Cours du jour, chaque matin où il y a cours |
+| `/config edt-modifs salon:` | serveur | Cours déplacés / ajoutés / annulés (14 prochains jours) |
+| `/config edt-stop quoi:` | serveur | Coupe l'une des trois (ou tout l'EDT) |
+| `/config voir` | serveur | **Toutes** les configs du serveur : actives, arrêtées, pas encore faites |
 | `/notes verifier` | partout | Relève les notes maintenant et annonce les nouvelles (matière seulement) |
 | `/notes statut` | partout | Dernier relevé, prochain, dernière erreur |
 | `/notes code <code>` | partout, **propriétaire** | Donne le code 2FA demandé en MP |
