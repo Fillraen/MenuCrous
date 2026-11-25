@@ -204,9 +204,9 @@ class MenuCrous(commands.Bot):
                 raise
             avant = await self.db.get_json("notes_snapshot")
             nouvelles = notes_mod.diff(avant or {}, toutes) if avant is not None else []
-            await self.db.set_json("notes_snapshot", {n.cle: n.to_dict() for n in toutes})
+            await self.db.set_json("notes_snapshot", notes_mod.instantane(toutes))
             self.notes_etat.update(erreur=None, dernier_passage=maintenant().isoformat(),
-                                   nb=sum(n.publiee for n in toutes))
+                                   nb=sum(n.publiee and n.detail for n in toutes))
             if avant is None:
                 log.info("Premier relevé des notes : %d lignes mémorisées, pas d'alerte", len(toutes))
             return toutes, nouvelles
@@ -231,30 +231,25 @@ class MenuCrous(commands.Bot):
         finally:
             self.code_attendu = None
 
-    async def annoncer_notes(self, nouvelles: list[notes_mod.Note]) -> None:
+    async def annoncer_notes(self, nouvelles: list[notes_mod.Note], sauf_salon: int | None = None) -> None:
+        """Annonce les matières qui ont une nouvelle note. Jamais la note elle-même."""
         if not nouvelles:
             return
-        matieres = "\n".join(f"• **{n.matiere}**" for n in nouvelles)
-        # 1) Salons configurés : la matière seulement, jamais la note
+        embed = notes_embed(notes_mod.matieres(nouvelles))
+        envoye = False
         for cfg in await self.db.notes_configs():
-            if not cfg.actif:
+            if not cfg.actif or cfg.channel_id == sauf_salon:
                 continue
             ch = self.get_channel(cfg.channel_id)
             if ch:
-                await ch.send(embed=discord.Embed(
-                    title="📢 Nouvelle(s) note(s) sur Mon Dossier Web", description=matieres,
-                    color=0x9B59B6).set_footer(text="Allez vérifier sur mondossierweb.insa-lyon.fr"))
-        # 2) MP au propriétaire avec les valeurs
-        await self._mp_proprietaire(nouvelles)
-
-    async def _mp_proprietaire(self, liste: list[notes_mod.Note]) -> None:
-        if not self.settings.notes_owner_id:
-            return
-        try:
-            user = await self.fetch_user(self.settings.notes_owner_id)
-            await user.send(embed=notes_embed("🎓 Nouvelle(s) note(s)", liste, valeurs=True))
-        except discord.HTTPException as exc:
-            log.warning("MP au propriétaire impossible : %s", exc)
+                await ch.send(embed=embed)
+                envoye = True
+        # Aucun salon configuré : MP au propriétaire, pour ne pas rater l'info
+        if not envoye and sauf_salon is None and self.settings.notes_owner_id:
+            try:
+                await (await self.fetch_user(self.settings.notes_owner_id)).send(embed=embed)
+            except discord.HTTPException as exc:
+                log.warning("MP au propriétaire impossible : %s", exc)
 
     @tasks.loop(minutes=30)
     async def surveille_notes(self) -> None:
@@ -273,19 +268,13 @@ class MenuCrous(commands.Bot):
         await self.wait_until_ready()
 
 
-def notes_embed(titre: str, liste: list[notes_mod.Note], valeurs: bool) -> discord.Embed:
-    e = discord.Embed(title=titre, color=0x9B59B6, url="https://mondossierweb.insa-lyon.fr/mondossierweb/notes")
-    lignes = []
-    for n in liste:
-        l = f"• **{n.matiere}**"
-        if n.code:
-            l += f" `{n.code}`"
-        if valeurs:
-            l += f" — **{n.valeur or '—'}**" + (f" ({n.resultat})" if n.resultat else "")
-        lignes.append(l)
-    desc = "\n".join(lignes) or "Aucune note."
-    e.description = desc if len(desc) <= 4000 else desc[:3990] + "\n…"
-    return e
+def notes_embed(matieres: list[str]) -> discord.Embed:
+    desc = "\n".join(f"• **{m}**" for m in matieres)
+    return discord.Embed(
+        title="📢 Nouvelle note sur Mon Dossier Web", color=0x9B59B6,
+        url="https://mondossierweb.insa-lyon.fr/mondossierweb/inscriptions",
+        description=desc if len(desc) <= 4000 else desc[:3990] + "\n…",
+    ).set_footer(text="Parcours → Notes et résultats")
 
 
 def _bot(inter: discord.Interaction) -> MenuCrous:
@@ -365,7 +354,6 @@ async def aide_cmd(inter: discord.Interaction) -> None:
     e.add_field(name="Notes INSA", inline=False, value=(
         "`/notes verifier` — regarde tout de suite s'il y a une nouvelle note\n"
         "`/notes statut` — dernier relevé, prochaine vérification\n"
-        "`/notes liste` — toutes les notes (propriétaire, en privé)\n"
         "`/notes code` — donner le code 2FA INSA demandé en MP (propriétaire)"))
     e.add_field(name="Réglages (gérer le serveur)", inline=False, value=(
         "`/config menu salon: heure: restaurants: complet:` — envoi automatique quotidien\n"
@@ -514,9 +502,9 @@ async def notes_verifier(inter: discord.Interaction) -> None:
     if not nouvelles:
         await inter.followup.send("🤷 Aucune nouvelle note depuis le dernier relevé.")
         return
-    await inter.followup.send(embed=notes_embed("📢 Nouvelle(s) note(s)", nouvelles, valeurs=False))
-    # Annonces habituelles (salons + MP) : ce relevé a « consommé » les nouveautés
-    await bot.annoncer_notes(nouvelles)
+    await inter.followup.send(embed=notes_embed(notes_mod.matieres(nouvelles)))
+    # Annonce aussi dans les salons configurés (ce relevé a « consommé » les nouveautés)
+    await bot.annoncer_notes(nouvelles, sauf_salon=inter.channel_id or 0)
 
 
 @notes_group.command(name="statut", description="Dernier relevé des notes et état de la surveillance")
@@ -554,22 +542,3 @@ async def notes_code(inter: discord.Interaction, code: str) -> None:
         return
     fut.set_result(code.strip())
     await inter.response.send_message("✅ Code transmis, connexion en cours…", ephemeral=True)
-
-
-@notes_group.command(name="liste", description="Toutes mes notes (propriétaire du bot uniquement, en privé)")
-async def notes_liste(inter: discord.Interaction) -> None:
-    bot = _bot(inter)
-    if not _proprio(inter):
-        await inter.response.send_message("🔒 Réservé au propriétaire du compte surveillé.", ephemeral=True)
-        return
-    await inter.response.defer(ephemeral=True, thinking=True)
-    snap = await bot.db.get_json("notes_snapshot")
-    if snap is None:
-        try:
-            await bot.verifier_notes()
-        except Exception as exc:
-            await inter.followup.send(f"❌ {exc}", ephemeral=True)
-            return
-        snap = await bot.db.get_json("notes_snapshot", {})
-    liste = [notes_mod.Note(**d) for d in snap.values() if d.get("valeur")]
-    await inter.followup.send(embed=notes_embed(f"🎓 Mes notes ({len(liste)})", liste, valeurs=True), ephemeral=True)

@@ -4,8 +4,8 @@ Bot Discord qui :
 
 - poste chaque matin (heure réglable) le menu des restaurants CROUS **Manufacture des Tabacs**
   et **Puvis de Chavannes** dans un salon, et répond à `/menu` ;
-- prévient quand une **nouvelle note** apparaît sur Mon Dossier Web (INSA Lyon) : la matière
-  dans un salon, la note en message privé au propriétaire du compte ;
+- prévient quand une **nouvelle note** apparaît sur Mon Dossier Web (INSA Lyon) : seulement
+  le nom de la matière, jamais la note ;
 - sert une petite page web des menus de la semaine (+ API JSON).
 
 Il s'installe **sur un serveur** (envois automatiques, `/config`) **et sur un compte
@@ -31,7 +31,6 @@ les desserts sous « Plat végétarien »).
 | `/restaurants` | partout | Adresse, horaires, accès |
 | `/notes verifier` | partout | Relève les notes maintenant et annonce les nouvelles (matière seulement) |
 | `/notes statut` | partout | Dernier relevé, prochain, dernière erreur |
-| `/notes liste` | partout, **propriétaire** | Toutes les notes, en privé |
 | `/notes code <code>` | partout, **propriétaire** | Donne le code 2FA demandé en MP |
 | `/config menu salon: heure: restaurants: complet:` | serveur, *Gérer le serveur* | Envoi automatique quotidien |
 | `/config menu-stop`, `/config notes salon:`, `/config notes-stop`, `/config voir`, `/config test` | serveur | Réglages |
@@ -43,9 +42,15 @@ l'heure prévue, l'envoi est rattrapé (jusqu'à 3 h de retard).
 ## Notes INSA
 
 Mon Dossier Web est une appli Vaadin derrière le SSO de l'INSA : le bot ouvre un Chromium
-headless (Playwright), se connecte avec `INSA_USERNAME` / `INSA_PASSWORD`, lit le tableau des
-notes et le compare au relevé précédent (SQLite). Relevé toutes les `NOTES_INTERVAL_MIN`
-minutes entre 7 h et 23 h. Le premier relevé ne déclenche aucune alerte.
+headless (Playwright), se connecte avec `INSA_USERNAME` / `INSA_PASSWORD`, va dans
+*Parcours → Notes et résultats* (chaque année d'inscription), déplie l'arborescence
+(semestre › UE › matière › épreuve) et la compare au relevé précédent. Relevé toutes les
+`NOTES_INTERVAL_MIN` minutes entre 7 h et 23 h. Le premier relevé ne déclenche aucune alerte.
+
+Seules les matières et épreuves comptent (pas les moyennes d'UE / semestre), et l'annonce
+liste les **matières** concernées, sans doublon. Les notes ne sont ni affichées ni stockées :
+la base ne garde qu'une empreinte (SHA-256 tronquée) de chaque note pour détecter un changement.
+Sans salon configuré (`/config notes`), l'annonce part en MP au propriétaire (`NOTES_OWNER_ID`).
 
 **2FA** : les cookies de session sont gardés dans `data/insa-session.json`, le 2FA n'est donc
 redemandé qu'à l'expiration de la session SSO. À ce moment-là : si `INSA_TOTP_SECRET` (clé du
@@ -53,8 +58,6 @@ QR code) est fourni, le bot génère le code seul ; sinon il envoie un MP au pro
 attend `/notes code 123456` (10 min), puis met le relevé automatique en pause jusqu'au
 prochain `/notes verifier`.
 
-Un seul compte est surveillé (celui du propriétaire, `NOTES_OWNER_ID`) : les salons ne voient
-que la matière, jamais la note.
 
 Test manuel (enregistre une capture et le HTML dans `data/debug/`) :
 
