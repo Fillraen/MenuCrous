@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -55,17 +56,64 @@ def _propre(t: str) -> str:
     return re.sub(r"\s+", " ", t or "").strip()
 
 
-async def _login(page: Page, username: str, password: str) -> None:
+class DeuxFacteursRequis(LoginError):
+    """Le SSO demande un code 2FA et on n'a ni clé TOTP ni code fourni à temps."""
+
+
+# Champ de code 2FA de Keycloak (OTP) : id/name « otp », parfois « totp » ou « code »
+_OTP_SEL = "input#otp, input[name=otp], input#totp, input[name=totp], input[name=code][type!=hidden]"
+_ERR_SEL = "#input-error, #input-error-otp-code, .pf-m-error, .alert-error, .kc-feedback-text"
+
+# Callback appelé quand un code 2FA est nécessaire et qu'il n'y a pas de clé TOTP :
+# reçoit le texte affiché par la page, renvoie le code (ou None si personne ne répond).
+DemandeCode = Callable[[str], Awaitable[str | None]]
+
+
+async def _erreur_page(page: Page) -> str:
+    try:
+        return _propre(" ".join(await page.locator(_ERR_SEL).all_inner_texts()))
+    except Exception:
+        return ""
+
+
+async def _login(page: Page, username: str, password: str, totp_secret: str = "",
+                 demande_code: DemandeCode | None = None) -> None:
     if LOGIN_HOST not in page.url:
-        return  # session déjà valide
-    await page.fill("#username", username)
+        return  # session (cookies sauvegardés) encore valide
+    log.info("Session INSA expirée : connexion")
+    if await page.locator("#username").count():
+        await page.fill("#username", username)
     await page.fill("#password", password)
     await page.click("#kc-login")
     try:
+        await page.wait_for_url(lambda u: LOGIN_HOST not in u, timeout=10_000)
+        return
+    except PWTimeout:
+        pass
+    # Toujours sur le SSO : soit erreur d'identifiants, soit étape 2FA
+    if not await page.locator(_OTP_SEL).count():
+        raise LoginError(await _erreur_page(page) or f"Connexion INSA bloquée sur {page.url}")
+    consigne = _propre(await page.locator("form").first.inner_text())[:300]
+    if totp_secret:
+        import pyotp
+
+        code = pyotp.TOTP(totp_secret.replace(" ", "").upper()).now()
+    elif demande_code:
+        code = await demande_code(consigne)
+        if not code:
+            raise DeuxFacteursRequis("Code 2FA non fourni à temps")
+    else:
+        raise DeuxFacteursRequis(f"2FA demandé : {consigne}")
+    await page.locator(_OTP_SEL).first.fill(code.strip())
+    # « Faire confiance à cet appareil » s'il existe : moins de 2FA ensuite
+    for sel in ("input[name=trustDevice]", "input#trustDevice", "input[name=rememberMe]"):
+        if await page.locator(sel).count():
+            await page.locator(sel).first.check()
+    await page.locator("#kc-login, input[type=submit], button[type=submit]").first.click()
+    try:
         await page.wait_for_url(lambda u: LOGIN_HOST not in u, timeout=NAV_TIMEOUT)
     except PWTimeout:
-        err = await page.locator("#input-error, .pf-m-error, .alert-error, [id*=error]").all_inner_texts()
-        raise LoginError(_propre(" ".join(err)) or "Connexion INSA refusée (identifiants ? MFA ?)")
+        raise LoginError(await _erreur_page(page) or "Code 2FA refusé")
 
 
 async def _extraire(page: Page) -> list[Note]:
@@ -131,16 +179,29 @@ async def _extraire(page: Page) -> list[Note]:
 
 
 async def fetch_notes(
-    username: str, password: str, url: str, debug_dir: Path | None = None
+    username: str, password: str, url: str, debug_dir: Path | None = None, *,
+    session_file: Path | None = None, totp_secret: str = "", demande_code: DemandeCode | None = None,
 ) -> list[Note]:
+    """Relève les notes. Les cookies sont gardés dans ``session_file`` entre deux relevés :
+    tant que la session SSO de l'INSA est valide, pas de mot de passe ni de 2FA."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
-            ctx = await browser.new_context(locale="fr-FR", timezone_id="Europe/Paris")
+            etat = str(session_file) if session_file and session_file.exists() else None
+            ctx = await browser.new_context(locale="fr-FR", timezone_id="Europe/Paris", storage_state=etat)
             page = await ctx.new_page()
             page.set_default_timeout(NAV_TIMEOUT)
             await page.goto(url, wait_until="domcontentloaded")
-            await _login(page, username, password)
+            try:
+                await _login(page, username, password, totp_secret, demande_code)
+            except LoginError:
+                if debug_dir is not None:
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(path=str(debug_dir / "login.png"), full_page=True)
+                raise
+            if session_file:
+                await ctx.storage_state(path=str(session_file))
+                session_file.chmod(0o600)
             if page.url.rstrip("/") != url.rstrip("/"):
                 await page.goto(url, wait_until="domcontentloaded")
             # Vaadin : attendre que la grille ait des lignes
@@ -182,11 +243,19 @@ if __name__ == "__main__":  # python -m menucrous.notes : test manuel, sauvegard
     from dotenv import load_dotenv
 
     load_dotenv()
+    logging.basicConfig(level=logging.INFO)
+
+    async def code_console(consigne: str) -> str:
+        print(f"\n2FA demandé : {consigne}")
+        return await asyncio.to_thread(input, "Code : ")
+
+    data = Path(os.environ.get("DATA_DIR", "./data"))
     res = asyncio.run(
         fetch_notes(
             os.environ["INSA_USERNAME"], os.environ["INSA_PASSWORD"],
             os.environ.get("NOTES_URL", "https://mondossierweb.insa-lyon.fr/mondossierweb/notes"),
-            Path(os.environ.get("DATA_DIR", "./data")) / "debug",
+            data / "debug", session_file=data / "insa-session.json",
+            totp_secret=os.environ.get("INSA_TOTP_SECRET", ""), demande_code=code_console,
         )
     )
     for n in res:

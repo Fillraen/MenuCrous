@@ -62,6 +62,7 @@ class Settings:
     # Mon Dossier Web (INSA) — un seul compte surveillé : celui du propriétaire
     insa_username: str
     insa_password: str
+    insa_totp_secret: str  # clé du QR code 2FA (facultatif) : codes générés sans toi
     notes_owner_id: int | None
     notes_url: str
     notes_interval_min: int
@@ -89,6 +90,7 @@ def load_settings() -> Settings:
         default_notes_channel=_int("NOTES_CHANNEL_ID"),
         insa_username=os.environ.get("INSA_USERNAME", "").strip(),
         insa_password=os.environ.get("INSA_PASSWORD", ""),
+        insa_totp_secret=os.environ.get("INSA_TOTP_SECRET", "").strip(),
         notes_owner_id=_int("NOTES_OWNER_ID"),
         notes_url=os.environ.get(
             "NOTES_URL", "https://mondossierweb.insa-lyon.fr/mondossierweb/notes"

@@ -32,6 +32,7 @@ les desserts sous « Plat végétarien »).
 | `/notes verifier` | partout | Relève les notes maintenant et annonce les nouvelles (matière seulement) |
 | `/notes statut` | partout | Dernier relevé, prochain, dernière erreur |
 | `/notes liste` | partout, **propriétaire** | Toutes les notes, en privé |
+| `/notes code <code>` | partout, **propriétaire** | Donne le code 2FA demandé en MP |
 | `/config menu salon: heure: restaurants: complet:` | serveur, *Gérer le serveur* | Envoi automatique quotidien |
 | `/config menu-stop`, `/config notes salon:`, `/config notes-stop`, `/config voir`, `/config test` | serveur | Réglages |
 | `/aide` | partout | Aide |
@@ -45,6 +46,12 @@ Mon Dossier Web est une appli Vaadin derrière le SSO de l'INSA : le bot ouvre u
 headless (Playwright), se connecte avec `INSA_USERNAME` / `INSA_PASSWORD`, lit le tableau des
 notes et le compare au relevé précédent (SQLite). Relevé toutes les `NOTES_INTERVAL_MIN`
 minutes entre 7 h et 23 h. Le premier relevé ne déclenche aucune alerte.
+
+**2FA** : les cookies de session sont gardés dans `data/insa-session.json`, le 2FA n'est donc
+redemandé qu'à l'expiration de la session SSO. À ce moment-là : si `INSA_TOTP_SECRET` (clé du
+QR code) est fourni, le bot génère le code seul ; sinon il envoie un MP au propriétaire et
+attend `/notes code 123456` (10 min), puis met le relevé automatique en pause jusqu'au
+prochain `/notes verifier`.
 
 Un seul compte est surveillé (celui du propriétaire, `NOTES_OWNER_ID`) : les salons ne voient
 que la matière, jamais la note.

@@ -73,6 +73,10 @@ class MenuCrous(commands.Bot):
         self.db = Database(settings.data_dir / "menucrous.db")
         self.notes_etat: dict = {"dernier_passage": None, "erreur": None, "nb": 0}
         self.notes_lock = asyncio.Lock()
+        # 2FA : code attendu du propriétaire (/notes code), et pause du relevé auto tant
+        # qu'un code a été demandé sans réponse (pour ne pas le harceler toutes les 30 min).
+        self.code_attendu: asyncio.Future[str] | None = None
+        self.notes_en_pause = False
         self.demarrage = time.time()
 
     # ── Démarrage ─────────────────────────────────────────────────────────────
@@ -187,7 +191,14 @@ class MenuCrous(commands.Bot):
         async with self.notes_lock:
             try:
                 toutes = await notes_mod.fetch_notes(
-                    s.insa_username, s.insa_password, s.notes_url, s.data_dir / "debug")
+                    s.insa_username, s.insa_password, s.notes_url, s.data_dir / "debug",
+                    session_file=s.data_dir / "insa-session.json", totp_secret=s.insa_totp_secret,
+                    demande_code=self._demander_code)
+                self.notes_en_pause = False
+            except notes_mod.DeuxFacteursRequis as exc:
+                self.notes_en_pause = True
+                self.notes_etat.update(erreur=f"2FA : {exc}", dernier_passage=maintenant().isoformat())
+                raise
             except Exception as exc:
                 self.notes_etat.update(erreur=str(exc)[:500], dernier_passage=maintenant().isoformat())
                 raise
@@ -199,6 +210,26 @@ class MenuCrous(commands.Bot):
             if avant is None:
                 log.info("Premier relevé des notes : %d lignes mémorisées, pas d'alerte", len(toutes))
             return toutes, nouvelles
+
+    async def _demander_code(self, consigne: str) -> str | None:
+        """Session INSA expirée et 2FA demandé : MP au propriétaire, attente de /notes code."""
+        if not self.settings.notes_owner_id:
+            return None
+        loop = asyncio.get_running_loop()
+        self.code_attendu = loop.create_future()
+        try:
+            user = await self.fetch_user(self.settings.notes_owner_id)
+            await user.send(embed=discord.Embed(
+                title="🔐 Code 2FA INSA demandé", color=0xF1C40F,
+                description=(f"La session Mon Dossier Web a expiré, l'INSA demande un code :\n> {consigne[:300]}\n\n"
+                             "Réponds avec **`/notes code 123456`** dans les 10 minutes.\n"
+                             "Astuce : avec `INSA_TOTP_SECRET` dans le .env, le bot génère le code tout seul.")))
+            return await asyncio.wait_for(self.code_attendu, timeout=600)
+        except (asyncio.TimeoutError, discord.HTTPException) as exc:
+            log.warning("Code 2FA non reçu : %s", exc)
+            return None
+        finally:
+            self.code_attendu = None
 
     async def annoncer_notes(self, nouvelles: list[notes_mod.Note]) -> None:
         if not nouvelles:
@@ -228,7 +259,7 @@ class MenuCrous(commands.Bot):
     @tasks.loop(minutes=30)
     async def surveille_notes(self) -> None:
         h = maintenant().hour
-        if h < 7 or h >= 23:  # personne ne publie de notes la nuit
+        if h < 7 or h >= 23 or self.notes_en_pause:  # nuit, ou 2FA en attente de /notes verifier
             return
         try:
             _, nouvelles = await self.verifier_notes()
@@ -334,7 +365,8 @@ async def aide_cmd(inter: discord.Interaction) -> None:
     e.add_field(name="Notes INSA", inline=False, value=(
         "`/notes verifier` — regarde tout de suite s'il y a une nouvelle note\n"
         "`/notes statut` — dernier relevé, prochaine vérification\n"
-        "`/notes liste` — toutes les notes (propriétaire, en privé)"))
+        "`/notes liste` — toutes les notes (propriétaire, en privé)\n"
+        "`/notes code` — donner le code 2FA INSA demandé en MP (propriétaire)"))
     e.add_field(name="Réglages (gérer le serveur)", inline=False, value=(
         "`/config menu salon: heure: restaurants: complet:` — envoi automatique quotidien\n"
         "`/config menu-stop` · `/config notes salon:` · `/config notes-stop`\n"
@@ -472,6 +504,10 @@ async def notes_verifier(inter: discord.Interaction) -> None:
     await inter.response.defer(thinking=True)
     try:
         _, nouvelles = await bot.verifier_notes()
+    except notes_mod.DeuxFacteursRequis:
+        await inter.followup.send("🔐 L'INSA demande un code 2FA : le propriétaire doit répondre en MP "
+                                  "(`/notes code`), puis relancer `/notes verifier`.")
+        return
     except Exception as exc:
         await inter.followup.send(f"❌ Relevé impossible : {str(exc)[:300]}")
         return
@@ -501,6 +537,23 @@ async def notes_statut(inter: discord.Interaction) -> None:
     if et["erreur"]:
         e.add_field(name="⚠️ Dernière erreur", value=et["erreur"][:1000], inline=False)
     await inter.response.send_message(embed=e, ephemeral=True)
+
+
+@notes_group.command(name="code", description="Donner le code 2FA INSA demandé en MP (propriétaire)")
+@app_commands.describe(code="Code à 6 chiffres reçu / affiché par ton appli 2FA")
+async def notes_code(inter: discord.Interaction, code: str) -> None:
+    bot = _bot(inter)
+    if not _proprio(inter):
+        await inter.response.send_message("🔒 Réservé au propriétaire du compte surveillé.", ephemeral=True)
+        return
+    fut = bot.code_attendu
+    if fut is None or fut.done():
+        await inter.response.send_message(
+            "Aucun code attendu en ce moment. Lance `/notes verifier` : si l'INSA demande un code, "
+            "je te le redemande.", ephemeral=True)
+        return
+    fut.set_result(code.strip())
+    await inter.response.send_message("✅ Code transmis, connexion en cours…", ephemeral=True)
 
 
 @notes_group.command(name="liste", description="Toutes mes notes (propriétaire du bot uniquement, en privé)")
