@@ -8,3 +8,4 @@ tzdata>=2024.1
 pyotp>=2.9
 pillow>=11
 cryptography>=43
+wordfreq>=3.1
