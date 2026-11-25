@@ -1,23 +1,22 @@
-"""🤫 Easter egg : un mot japonais écrit en rōmaji dans un message → « Baka ! » + GIF d'anime.
+"""🤫 Easter egg : du japonais dans un message → réponse adaptée + GIF d'anime (SFW).
 
-Détection en deux temps :
-  1. liste de mots/expressions connus (kawaii, senpai, ara ara…), toujours reconnus ;
-  2. sinon, chaque mot du message est découpé en syllabes japonaises (ka, shi, tsu, kyo, n…) :
-     s'il se découpe entièrement, a au moins 3 syllabes différentes et n'est PAS un mot
-     courant en français / anglais / espagnol / italien (wordfreq), c'est du rōmaji.
-     → « tadaima », « yokatta », « hajimemashite » oui ; « tomate », « domaine », « hahaha » non.
+Détection (dans l'ordre) :
+  1. écriture japonaise (hiragana, katakana, kanji) ;
+  2. mots / expressions connus, rangés par thème (salut, merci, bouffe, dodo, mignon…) ;
+  3. suffixes honorifiques collés à un mot : « Nicolas-kun », « prof-sensei », « Léa-chan » ;
+  4. terminaisons verbales typiques : -masu, -mashita, -masen, -mashou, -desu, -nai desu… ;
+  5. découpage en syllabes japonaises (ka, shi, tsu, kyo, n…) d'un mot qui n'est PAS un mot
+     courant en français / anglais / espagnol / italien (wordfreq) : « yokatta », « hajimemashite ».
 
-GIF : nekos.best (réactions d'anime, SFW uniquement).
-
-Demande l'intent privilégié « Message Content » (Developer Portal → Bot), activé seulement si
-SECRET_ROMAJI=1. Volontairement absent de /aide.
+Chaque thème a ses réponses et ses GIF (catégories nekos.best choisies, toutes SFW).
+Demande l'intent privilégié « Message Content », activé seulement si SECRET_ROMAJI=1.
+Volontairement absent de /aide.
 """
 from __future__ import annotations
 
 import logging
 import random
 import re
-import time
 
 import discord
 import httpx
@@ -25,15 +24,101 @@ from wordfreq import zipf_frequency
 
 log = logging.getLogger(__name__)
 
-# ── 1. Mots connus (y compris ceux que le filtre de fréquence écarterait) ────────────────
-MOTS = [
-    "kawaii", "senpai", "sempai", "sugoi", "konnichiwa", "nakama", "baka", "nani", "desu", "ara ara",
-    "onii chan", "oniichan", "onee chan", "oneechan", "nee chan", "yamete kudasai", "moshi moshi",
-    "omae wa mou shindeiru", "chotto matte", "sou desu ne", "domo arigato", "arigatou gozaimasu",
-    "plus ultra", "shinzou wo sasageyo", "dattebayo", "kamisama", "kami sama", "otsukaresama", "yosh",
-]
-# Mots qui existent aussi en français : seulement s'ils sont seuls dans le message
-SEULS = {"uso", "dame", "matte", "itai", "nani", "baka", "souka", "hai"}
+# ── Thèmes : mots → (GIF nekos.best, réponses) ──────────────────────────────────────────
+THEMES: dict[str, dict] = {
+    "salut": {
+        "mots": ["konnichiwa", "konnichiha", "konbanwa", "ohayo", "ohayou", "ohayo gozaimasu", "ohayou gozaimasu",
+                 "moshi moshi", "yahallo", "yaho", "hisashiburi", "ossu", "irasshaimase", "hajimemashite",
+                 "yoroshiku", "yoroshiku onegaishimasu", "sayonara", "sayounara", "mata ne", "ja ne", "jaa ne",
+                 "mata ashita", "bai bai"],
+        "gifs": ["wave", "wave", "smile", "happy"],
+        "reponses": ["Konnichiwa ! 👋", "Ohayo~ ☀️", "Yaho ! ✨", "Mata ne ! 👋", "Yoroshiku ne ! 🙇",
+                     "Irasshaimase ! 🏮"],
+    },
+    "maison": {
+        "mots": ["tadaima", "okaeri", "okaerinasai", "ittekimasu", "itterasshai"],
+        "gifs": ["wave", "happy", "hug", "smile"],
+        "reponses": ["Okaeri ! 🏠", "Okaerinasai~ 🍵", "Itterasshai ! 🚪", "Tadaima toi-même ! 🏡"],
+    },
+    "merci": {
+        "mots": ["arigatou", "arigato", "arigatou gozaimasu", "arigato gozaimasu", "domo arigato", "doumo",
+                 "domo", "sankyuu", "doitashimashite", "dou itashimashite", "otsukare", "otsukaresama",
+                 "otsukaresama desu"],
+        "gifs": ["thumbsup", "smile", "nod", "happy"],
+        "reponses": ["Dou itashimashite ! 🙏", "Iie iie, c'est rien ! 😊", "Otsukaresama ! 🍵",
+                     "De rien, nakama ! 🤝"],
+    },
+    "pardon": {
+        "mots": ["gomen", "gomenasai", "gomen nasai", "gomenne", "sumimasen", "shitsurei shimasu",
+                 "moushiwake arimasen"],
+        "gifs": ["pat", "pat", "smile", "shrug"],
+        "reponses": ["Daijoubu, daijoubu ! 🫶", "Ii yo, ii yo~ 😌", "Pardonné... pour cette fois. 😤", "*pat pat* 🫳"],
+    },
+    "bouffe": {
+        "mots": ["itadakimasu", "gochisousama", "gochisousama deshita", "oishii", "oishi", "umai", "umee",
+                 "onaka suita", "harahetta", "bento", "onigiri", "dango", "taiyaki", "mochi", "takoyaki",
+                 "okonomiyaki", "yakitori", "gyoza", "udon", "soba", "matcha", "onigiri"],
+        "gifs": ["nom", "nom", "happy", "feed"],
+        "reponses": ["Itadakimasu ! 🍙", "Oishii~ 🍜", "Gochisousama deshita ! 🙏", "Onaka suita... 🍱",
+                     "Le CROUS c'est pas du takoyaki mais bon. 🍛"],
+    },
+    "dodo": {
+        "mots": ["oyasumi", "oyasuminasai", "nemui", "nemuii", "nenne", "ohiru"],
+        "gifs": ["sleep", "yawn", "sleep", "cuddle"],
+        "reponses": ["Oyasumi~ 🌙", "Oyasuminasai ! 💤", "Nemui... moi aussi. 😴", "Yume de aou ne ! 🌌"],
+    },
+    "mignon": {
+        "mots": ["kawaii", "kawaiii", "kawaisou", "kirei", "suki", "daisuki", "daisuki da yo", "aishiteru",
+                 "doki doki", "uwu", "nyan", "nya", "neko", "moe", "chibi"],
+        "gifs": ["blush", "blush", "happy", "smile", "wink"],
+        "reponses": ["K-kawaii ?! 😳", "Doki doki... 💓", "Nyan~ 🐱", "Tu es kawaii toi-même ! 🌸",
+                     "Uwu détecté. 🎀"],
+    },
+    "classe": {
+        "mots": ["kakkoii", "sugoi", "sugee", "sugoii", "subarashii", "yabai", "yabee", "sasuga", "saikou",
+                 "kanpeki", "omoshiroi", "tanoshii", "ii ne", "nice desu"],
+        "gifs": ["thumbsup", "smug", "dance", "happy"],
+        "reponses": ["Sugoi desu ne ! ✨", "Yabai yabai ! 🔥", "Sasuga ! 😎", "Kakkoii~ 🗡️", "Saikou ! 🏆"],
+    },
+    "motivation": {
+        "mots": ["ganbatte", "ganbare", "ganbarimasu", "ganbarou", "faito", "ikuzo", "ikou", "yosh", "yoshi",
+                 "yatta", "yattaa", "kanpai", "kampai", "plus ultra", "shinzou wo sasageyo", "dattebayo",
+                 "nakama", "makenai"],
+        "gifs": ["thumbsup", "dance", "highfive", "happy"],
+        "reponses": ["Ganbatte ! 💪", "Faito ! 🔥", "Yatta ! 🎉", "Kanpai ! 🍻", "Ikuzo ! ⚔️",
+                     "Plus Ultra ! 💥", "Shinzou wo sasageyo ! 🫡"],
+    },
+    "surprise": {
+        "mots": ["nani", "nande", "naze", "eeeh", "ehhh", "uso", "maji", "majide", "honto", "hontou",
+                 "hontou ni", "masaka", "naruhodo", "souka", "sou desu ka", "sou desu ne", "wakaranai",
+                 "wakarimasen", "shiranai", "chotto matte", "matte", "ara ara", "ara"],
+        "gifs": ["stare", "think", "shrug", "facepalm"],
+        "reponses": ["NANI ?! 😱", "Masaka... 😶", "Naruhodo naruhodo. 🤔", "Ara ara~ 😏", "Eeeeh ?! 😳",
+                     "Maji de ?! 👀"],
+    },
+    "taquin": {
+        "mots": ["baka", "bakayaro", "aho", "urusai", "urusee", "yamete", "yamete kudasai", "yamero", "dame",
+                 "dame dame", "itai", "kimoi", "uzai", "omae wa mou shindeiru", "senpai", "sempai",
+                 "notice me senpai", "onii chan", "oniichan", "onee chan", "oneechan", "nee chan", "imouto",
+                 "otaku", "weeb", "waifu", "husbando", "tsundere", "yandere", "kuudere", "desu", "desu ne",
+                 "kudasai", "onegai", "onegaishimasu", "kamisama", "kami sama", "sensei", "kohai"],
+        "gifs": ["baka", "baka", "smug", "pout", "nope", "facepalm"],
+        "reponses": ["Baka ! 😤", "B-baka ! C'est pas comme si j'avais envie de te répondre... 😳",
+                     "Hmph. Baka. 😒", "Urusai urusai urusai ! 💢", "Omae wa mou... baka. 💀",
+                     "Senpai m'a remarqué ?! 🙈", "Dame dame ! 🙅", "Weeb détecté. 🍙"],
+    },
+}
+# Thème par défaut (mot japonais trouvé par syllabes, suffixe, terminaison ou écriture japonaise)
+DEFAUT = {
+    "gifs": ["baka", "smug", "stare", "think", "happy", "wave", "thumbsup", "shrug", "blush", "pout"],
+    "reponses": ["Nihongo jouzu desu ne ! 🇯🇵", "Oh, du japonais ! 👀", "Weeb détecté. 🍙", "Sugoi, tu parles japonais ? ✨",
+                 "Baka ! 😤", "Naruhodo... 🤔", "Hmph, kawaii. 😳", "Wakarimasen... mais respect. 🙇"],
+}
+
+# Mots qui existent aussi en français / anglais : seulement s'ils sont seuls dans le message
+SEULS = {"uso", "dame", "matte", "itai", "nani", "baka", "souka", "hai", "ara", "domo", "aho", "moe", "nya",
+         "neko", "mochi", "udon", "soba", "ii ne", "sensei", "otaku", "ikou", "honto", "maji", "suki", "yaho",
+         "chibi", "weeb", "waifu", "desu", "kirei"}
 
 
 def _motif(mot: str) -> str:
@@ -41,23 +126,34 @@ def _motif(mot: str) -> str:
     return r"[\s\-_]*".join(etire(part) for part in mot.split())
 
 
-RE_MOTS = re.compile(r"(?<![\w])(" + "|".join(_motif(m) for m in sorted(MOTS, key=len, reverse=True))
-                     + r")(?![\w])", re.IGNORECASE)
-RE_SEUL = re.compile(r"^\W*(" + "|".join(_motif(m) for m in SEULS) + r")\W*$", re.IGNORECASE)
+def _norme(mot: str) -> str:
+    return re.sub(r"(.)\1+", r"\1", re.sub(r"[\s\-_]", "", mot.lower()))
 
-# ── 2. Syllabes du rōmaji (Hepburn) ─────────────────────────────────────────────────────
+
+_MOT_THEME: dict[str, str] = {}
+for _theme, _d in THEMES.items():
+    for _m in _d["mots"]:
+        _MOT_THEME.setdefault(_norme(_m), _theme)
+_TOUS = sorted({m for d in THEMES.values() for m in d["mots"]}, key=len, reverse=True)
+RE_MOTS = re.compile(r"(?<![\w])(" + "|".join(_motif(m) for m in _TOUS) + r")(?![\w])", re.IGNORECASE)
+RE_SEUL = re.compile(r"^\W*(" + "|".join(_motif(m) for m in SEULS) + r")\W*$", re.IGNORECASE)
+_SEULS_NORMES = {_norme(m) for m in SEULS}
+
+# ── Autres façons de reconnaître du japonais ────────────────────────────────────────────
+RE_ECRITURE = re.compile(r"[぀-ゟ゠-ヿ一-龯ｦ-ﾟ]+")  # kana, kanji
+RE_HONORIFIQUE = re.compile(r"(?<![\w])[A-Za-zÀ-ÿ]{2,}-(kun|chan|sama|san|senpai|sensei|dono|tan|chin)(?![\w])",
+                            re.IGNORECASE)
+RE_TERMINAISON = re.compile(
+    r"(?<![\w])[a-z]{2,}(masu|mashita|masen|mashou|mashita|masendeshita|nasai|kudasai|tai desu|desu ka)(?![\w])",
+    re.IGNORECASE)
 _SYL = r"(?:ky|gy|sh|ch|ny|hy|by|py|my|ry|ts|j|f|[kgsztdnhbpmryw])?[aeiou]|n(?![aeiouy])|([kstp])(?=\1)"
 RE_SYL_MOT = re.compile(r"^(?:" + _SYL + r")+$")
 RE_SYL = re.compile(_SYL)
-SEUIL_FREQ = 1.5  # zipf : au-dessus, c'est un mot courant d'une langue européenne
-
-
-def _reduit(mot: str) -> str:
-    return re.sub(r"(.)\1{2,}", r"\1", mot)  # « sugoiiii » → « sugoi », « ouiii » → « oui »
 
 
 def est_romaji(mot: str) -> bool:
-    mot = _reduit(mot.lower())
+    """Mot qui se découpe entièrement en syllabes japonaises et n'est pas un mot européen courant."""
+    mot = re.sub(r"(.)\1{2,}", r"\1", mot.lower())
     if len(mot) < 5 or not RE_SYL_MOT.match(mot):
         return False
     syllabes = [m.group(0) for m in RE_SYL.finditer(mot) if m.group(0)[-1] in "aeiou"]
@@ -65,43 +161,38 @@ def est_romaji(mot: str) -> bool:
         return False
     if sum(c in "aeiou" for c in mot) / len(mot) > 0.7:  # ouaiii
         return False
-    return max(zipf_frequency(mot, langue) for langue in ("fr", "en", "es", "it")) < SEUIL_FREQ
+    return max(zipf_frequency(mot, langue) for langue in ("fr", "en", "es", "it")) < 1.5
 
 
-def detecte(texte: str) -> str | None:
-    """Renvoie le mot japonais trouvé (ou None)."""
+def detecte(texte: str) -> tuple[str, str] | None:
+    """(mot trouvé, thème) ou None."""
     if not texte or len(texte) > 1500:
         return None
     texte = re.sub(r"https?://\S+|<[@#:a-z][^>]*>|`[^`]*`|:\w+:", " ", texte)  # liens, mentions, code, émojis
-    m = RE_MOTS.search(texte)
-    if m:
+    seul = RE_SEUL.match(texte)
+    if seul:
+        mot = seul.group(1).lower()
+        return mot, _MOT_THEME.get(_norme(mot), "taquin")
+    for m in RE_MOTS.finditer(texte):
         mot = m.group(1).lower()
-        base = _reduit(re.sub(r"[\s\-_]", "", mot))
-        if base not in SEULS or RE_SEUL.match(texte):
-            return mot
-    if RE_SEUL.match(texte):
-        return RE_SEUL.match(texte).group(1).lower()
+        if _norme(mot) not in _SEULS_NORMES:
+            return mot, _MOT_THEME.get(_norme(mot), "taquin")
+    if (m := RE_ECRITURE.search(texte)):
+        return m.group(0), "defaut"
+    if (m := RE_HONORIFIQUE.search(texte)):
+        return m.group(0).lower(), "taquin"
+    if (m := RE_TERMINAISON.search(texte)):
+        return m.group(0).lower(), "defaut"
     for mot in re.findall(r"[A-Za-z]+", texte):
         if est_romaji(mot):
-            return mot.lower()
+            return mot.lower(), "defaut"
     return None
 
 
-# ── Réponse ─────────────────────────────────────────────────────────────────────────────
-REPONSES = [
-    "Baka ! 😤", "B-baka ! C'est pas comme si j'avais envie de te répondre... 😳", "Baka baka baka ! 💢",
-    "Nani ?! ... Baka. 🙄", "Weeb détecté. Baka ! 🍙", "Hmph. Baka. 😒", "Baka-senpai ! 🙈",
-]
-# Réactions nekos.best (catalogue SFW) : baka plus souvent que les autres
-REACTIONS = ["baka"] * 4 + ["pout", "smug", "facepalm", "stare", "nope"]
-COOLDOWN = 10  # secondes par salon
-_dernier: dict[int, float] = {}
-
-
-async def gif() -> tuple[str, str]:
-    """(url du GIF, nom de l'anime) depuis nekos.best."""
+async def gif(categorie: str) -> tuple[str, str]:
+    """(url du GIF, nom de l'anime) depuis nekos.best (catégories SFW choisies ci-dessus)."""
     async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "MenuCrous/2.0 (bot Discord)"}) as client:
-        r = await client.get(f"https://nekos.best/api/v2/{random.choice(REACTIONS)}")
+        r = await client.get(f"https://nekos.best/api/v2/{categorie}")
         r.raise_for_status()
         res = r.json()["results"][0]
         return res["url"], res.get("anime_name") or "anime"
@@ -110,18 +201,17 @@ async def gif() -> tuple[str, str]:
 async def sur_message(message: discord.Message) -> None:
     if message.author.bot or not message.content:
         return
-    mot = detecte(message.content)
-    if not mot:
+    trouve = detecte(message.content)
+    if not trouve:
         return
-    now = time.monotonic()
-    if now - _dernier.get(message.channel.id, 0) < COOLDOWN:
-        return
-    _dernier[message.channel.id] = now
+    mot, theme = trouve
+    d = THEMES.get(theme, DEFAUT)
+    texte = random.choice(d["reponses"])
     try:
-        url, anime = await gif()
+        url, anime = await gif(random.choice(d["gifs"]))
     except Exception as exc:
         log.warning("Easter egg : pas de GIF (%s)", exc)
-        await message.reply(random.choice(REPONSES), mention_author=False)
+        await message.reply(texte, mention_author=False)
         return
-    e = discord.Embed(color=0xFF6B9D).set_image(url=url).set_footer(text=f"« {mot} » détecté · {anime}")
-    await message.reply(random.choice(REPONSES), embed=e, mention_author=False)
+    e = discord.Embed(color=0xFF6B9D).set_image(url=url).set_footer(text=f"« {mot} » · {anime}")
+    await message.reply(texte, embed=e, mention_author=False)
