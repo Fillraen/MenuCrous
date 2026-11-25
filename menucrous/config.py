@@ -66,6 +66,8 @@ class Settings:
     notes_owner_id: int | None
     notes_url: str
     notes_interval_min: int
+    # Emploi du temps ADE (flux iCal personnel, le jeton est dans l'URL)
+    edt_ics_url: str
     # Petite page web publique (menu de la semaine + /health)
     web_port: int
     public_url: str
@@ -96,6 +98,7 @@ def load_settings() -> Settings:
             "NOTES_URL", "https://mondossierweb.insa-lyon.fr/mondossierweb/inscriptions"
         ),
         notes_interval_min=_int("NOTES_INTERVAL_MIN", 30) or 30,
+        edt_ics_url=os.environ.get("EDT_ICS_URL", "").strip(),
         web_port=_int("WEB_PORT", 8080) or 8080,
         public_url=os.environ.get("PUBLIC_URL", "").rstrip("/"),
     )

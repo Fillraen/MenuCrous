@@ -11,11 +11,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from . import edt as edt_mod
 from . import menu as menus
 from . import notes as notes_mod
 from .config import RESTAURANTS, TZ, Settings
-from .db import Database, MenuConfig, NotesConfig
-from .format import ferme_embed, jour_fr, menu_embed
+from .db import Database, EdtConfig, MenuConfig, NotesConfig
+from .format import (edt_changements_embed, edt_jour_embed, edt_semaine_embed, ferme_embed, jour_fr,
+                     menu_embed)
 
 log = logging.getLogger("menucrous")
 
@@ -85,11 +87,17 @@ class MenuCrous(commands.Bot):
         self.add_view(DetailNotes())  # bouton « Détail » des anciens messages, après redémarrage
         self.tree.add_command(config_group)
         self.tree.add_command(notes_group)
+        self.tree.add_command(edt_group)
         for cmd in (menu_cmd, semaine_cmd, restaurants_cmd, aide_cmd):
             self.tree.add_command(cmd)
         synced = await self.tree.sync()
         log.info("%d commandes slash synchronisées", len(synced))
         self.envoi_menus.start()
+        if self.settings.edt_ics_url:
+            self.envoi_edt.start()
+            self.surveille_edt.start()
+        else:
+            log.info("EDT_ICS_URL absent : emploi du temps désactivé")
         if self.settings.notes_enabled:
             self.surveille_notes.change_interval(minutes=self.settings.notes_interval_min)
             self.surveille_notes.start()
@@ -180,6 +188,89 @@ class MenuCrous(commands.Bot):
                 log.exception("Envoi auto du menu (serveur %s)", cfg.guild_id)
                 continue  # retenté la minute suivante
             await self.db.mark_menu_sent(cfg.guild_id, today)
+
+    # ── Emploi du temps ───────────────────────────────────────────────────────
+    async def _salon(self, cid: int):
+        ch = self.get_channel(cid)
+        if ch is None:
+            try:
+                ch = await self.fetch_channel(cid)
+            except discord.HTTPException:
+                log.warning("Salon %s introuvable", cid)
+        return ch
+
+    async def poster_edt(self, cfg: EdtConfig, quoi: str, d: date) -> bool:
+        """quoi = "semaine" (semaine contenant d) ou "jour". Renvoie False si rien posté."""
+        ch = await self._salon(cfg.channel_id)
+        if ch is None:
+            return False
+        cours = await edt_mod.get_cours(self.settings.edt_ics_url)
+        if quoi == "semaine":
+            await ch.send(embed=edt_semaine_embed(edt_mod.de_la_semaine(cours, d)))
+            return True
+        du_jour = edt_mod.du_jour(cours, d)
+        if not du_jour:
+            return False  # pas de cours : rien à poster
+        await ch.send(embed=edt_jour_embed(d, du_jour))
+        return True
+
+    @tasks.loop(minutes=1)
+    async def envoi_edt(self) -> None:
+        now = maintenant()
+        today = now.date()
+        lundi_iso = edt_mod.lundi(today).isoformat()
+        for cfg in await self.db.edt_configs():
+            if not cfg.actif:
+                continue
+            h, m = map(int, cfg.heure.split(":"))
+            prevu = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if not (prevu <= now < prevu + RATTRAPAGE):
+                continue
+            try:
+                if (cfg.mode in ("semaine", "les2") and today.weekday() == 0
+                        and cfg.derniere_semaine != lundi_iso):
+                    await self.poster_edt(cfg, "semaine", today)
+                    cfg.derniere_semaine = lundi_iso
+                    await self.db.set_edt_config(cfg)
+                if cfg.mode in ("jour", "les2") and cfg.dernier_jour != today.isoformat():
+                    # « les2 » le lundi : le récap de la semaine suffit
+                    if not (cfg.mode == "les2" and today.weekday() == 0):
+                        await self.poster_edt(cfg, "jour", today)
+                    cfg.dernier_jour = today.isoformat()
+                    await self.db.set_edt_config(cfg)
+            except Exception:
+                log.exception("Envoi auto de l'EDT (serveur %s)", cfg.guild_id)
+
+    @tasks.loop(minutes=30)
+    async def surveille_edt(self) -> None:
+        """Cours des 14 prochains jours déplacés / ajoutés / annulés."""
+        now = maintenant()
+        if now.hour < 7 or now.hour >= 23:
+            return
+        try:
+            cours = await edt_mod.get_cours(self.settings.edt_ics_url, force=True)
+        except Exception as exc:
+            log.warning("Lecture de l'EDT en échec : %s", exc)
+            return
+        today = now.date()
+        snap = await self.db.get_json("edt_snapshot")
+        await self.db.set_json("edt_snapshot", edt_mod.instantane(cours, today))
+        if not snap or "fin" not in snap:
+            log.info("Premier relevé de l'EDT : %d cours mémorisés", len(cours))
+            return
+        chg = edt_mod.changements(snap, cours, today)
+        if not chg:
+            return
+        log.info("EDT : %d changement(s)", len(chg))
+        embed = edt_changements_embed(chg)
+        for cfg in await self.db.edt_configs():
+            if cfg.actif and cfg.modifs and (ch := await self._salon(cfg.channel_id)):
+                await ch.send(embed=embed)
+
+    @envoi_edt.before_loop
+    @surveille_edt.before_loop
+    async def _avant_edt(self) -> None:
+        await self.wait_until_ready()
 
     @envoi_menus.before_loop
     async def _avant_menus(self) -> None:
@@ -413,9 +504,14 @@ async def aide_cmd(inter: discord.Interaction) -> None:
         "`/notes verifier` — regarde tout de suite s'il y a une nouvelle note\n"
         "`/notes statut` — dernier relevé, prochaine vérification\n"
         "`/notes code` — donner le code 2FA INSA demandé en MP (propriétaire)"))
+    e.add_field(name="Emploi du temps", inline=False, value=(
+        "`/edt jour quand:` — cours d'aujourd'hui, demain ou d'un jour de la semaine\n"
+        "`/edt semaine quand:` — cette semaine ou la suivante"))
     e.add_field(name="Réglages (gérer le serveur)", inline=False, value=(
         "`/config menu salon: heure: restaurants: complet:` — envoi automatique quotidien\n"
-        "`/config menu-stop` · `/config notes salon:` · `/config notes-stop`\n"
+        "`/config edt salon: mode: heure: modifs:` — EDT de la semaine (lundi) et/ou du jour\n"
+        "`/config notes salon:` — annonces de nouvelles notes\n"
+        "`/config menu-stop` · `/config edt-stop` · `/config notes-stop`\n"
         "`/config voir` · `/config test`"))
     if s.public_url:
         e.add_field(name="Sur le web", value=s.public_url, inline=False)
@@ -477,6 +573,62 @@ async def config_menu_stop(inter: discord.Interaction) -> None:
     await inter.response.send_message("🛑 Envoi automatique du menu arrêté.", ephemeral=True)
 
 
+MODES_EDT = {"semaine": "semaine le lundi", "jour": "chaque jour de cours", "les2": "semaine le lundi + chaque jour"}
+
+
+@config_group.command(name="edt", description="Envoi automatique de l'emploi du temps dans un salon")
+@app_commands.describe(salon="Salon où poster (défaut : celui-ci)",
+                       mode="Récap de la semaine le lundi, cours du jour chaque matin, ou les deux",
+                       heure="Heure d'envoi, ex. 07:30 (heure de Paris)",
+                       modifs="Annoncer les cours déplacés / ajoutés / annulés (14 prochains jours)")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Semaine (le lundi)", value="semaine"),
+    app_commands.Choice(name="Jour (chaque matin de cours)", value="jour"),
+    app_commands.Choice(name="Les deux", value="les2"),
+])
+async def config_edt(inter: discord.Interaction, salon: discord.TextChannel | None = None,
+                     mode: app_commands.Choice[str] | None = None, heure: str | None = None,
+                     modifs: bool | None = None) -> None:
+    bot = _bot(inter)
+    if not bot.settings.edt_ics_url:
+        await inter.response.send_message("❌ Pas de lien ADE (`EDT_ICS_URL`) sur le serveur.", ephemeral=True)
+        return
+    ancien = await bot.db.edt_config(inter.guild_id)
+    h = heure_valide(heure) if heure else (ancien.heure if ancien else "07:30")
+    if h is None:
+        await inter.response.send_message("❌ Heure invalide. Exemples : `07:30`, `7h`, `8h15`.", ephemeral=True)
+        return
+    ch = salon or inter.channel
+    perms = ch.permissions_for(inter.guild.me)
+    if not (perms.send_messages and perms.embed_links and perms.view_channel):
+        await inter.response.send_message(f"❌ Je n'ai pas le droit d'écrire (avec embeds) dans {ch.mention}.",
+                                          ephemeral=True)
+        return
+    cfg = EdtConfig(
+        inter.guild_id, ch.id, mode.value if mode else (ancien.mode if ancien else "semaine"), h,
+        modifs if modifs is not None else (ancien.modifs if ancien else True), True,
+        # Pas d'envoi immédiat si l'heure est déjà passée et que c'était déjà envoyé
+        ancien.dernier_jour if ancien else None, ancien.derniere_semaine if ancien else None,
+    )
+    await bot.db.set_edt_config(cfg)
+    await inter.response.send_message(
+        f"✅ Emploi du temps dans {ch.mention} : **{MODES_EDT[cfg.mode]}** à **{cfg.heure}**"
+        f"{', + alertes de modifications' if cfg.modifs else ''}. Rien n'est posté les jours sans cours.\n"
+        f"Aperçu tout de suite : `/edt semaine` ou `/edt jour`.", ephemeral=True)
+
+
+@config_group.command(name="edt-stop", description="Arrêter l'envoi automatique de l'emploi du temps")
+async def config_edt_stop(inter: discord.Interaction) -> None:
+    db = _bot(inter).db
+    cfg = await db.edt_config(inter.guild_id)
+    if not cfg or not cfg.actif:
+        await inter.response.send_message("L'envoi de l'emploi du temps n'est pas activé ici.", ephemeral=True)
+        return
+    cfg.actif = False
+    await db.set_edt_config(cfg)
+    await inter.response.send_message("🛑 Envoi automatique de l'emploi du temps arrêté.", ephemeral=True)
+
+
 @config_group.command(name="notes", description="Annoncer les nouvelles notes (matière seulement) dans un salon")
 @app_commands.describe(salon="Salon des annonces (défaut : celui-ci)")
 async def config_notes(inter: discord.Interaction, salon: discord.TextChannel | None = None) -> None:
@@ -514,6 +666,10 @@ async def config_voir(inter: discord.Interaction) -> None:
     e.add_field(name="Relevé des notes", inline=False, value=(
         f"Toutes les {bot.settings.notes_interval_min} min (7h–23h)" if bot.settings.notes_enabled
         else "Désactivé (identifiants INSA absents)"))
+    t = await bot.db.edt_config(inter.guild_id)
+    e.add_field(name="Emploi du temps", inline=False, value=(
+        f"{'✅' if t.actif else '🛑'} <#{t.channel_id}> — {MODES_EDT[t.mode]} à **{t.heure}**"
+        f"{' · modifications annoncées' if t.modifs else ''}") if t else "Non configuré")
     await inter.response.send_message(embed=e, ephemeral=True)
 
 
@@ -527,6 +683,57 @@ async def config_test(inter: discord.Interaction) -> None:
     await inter.response.defer(ephemeral=True, thinking=True)
     ok = await bot.poster_menu(cfg, maintenant().date())
     await inter.followup.send("✅ Menu posté." if ok else "📭 Pas de menu aujourd'hui (rien posté).", ephemeral=True)
+
+
+# ── /edt ──────────────────────────────────────────────────────────────────────
+edt_group = app_commands.Group(
+    name="edt", description="Emploi du temps (ADE INSA)",
+    allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+    allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True),
+)
+
+
+async def _cours_ou_erreur(inter: discord.Interaction) -> list | None:
+    bot = _bot(inter)
+    if not bot.settings.edt_ics_url:
+        await inter.followup.send("❌ Pas de lien ADE (`EDT_ICS_URL`) configuré sur le serveur.")
+        return None
+    try:
+        return await edt_mod.get_cours(bot.settings.edt_ics_url)
+    except Exception as exc:
+        await inter.followup.send(f"❌ Emploi du temps injoignable : {str(exc)[:300]}")
+        return None
+
+
+@edt_group.command(name="jour", description="Cours d'un jour (défaut : aujourd'hui)")
+@app_commands.describe(quand="Quel jour ?")
+@app_commands.choices(quand=CHOIX_JOUR)
+async def edt_jour(inter: discord.Interaction, quand: app_commands.Choice[str] | None = None) -> None:
+    await inter.response.defer(thinking=True)
+    cours = await _cours_ou_erreur(inter)
+    if cours is None:
+        return
+    d = resoudre_jour(quand.value if quand else None)
+    await inter.followup.send(embed=edt_jour_embed(d, edt_mod.du_jour(cours, d)))
+
+
+@edt_group.command(name="semaine", description="Emploi du temps de la semaine")
+@app_commands.describe(quand="Quelle semaine ?")
+@app_commands.choices(quand=[
+    app_commands.Choice(name="Cette semaine", value="0"),
+    app_commands.Choice(name="Semaine prochaine", value="1"),
+    app_commands.Choice(name="Dans 2 semaines", value="2"),
+])
+async def edt_semaine(inter: discord.Interaction, quand: app_commands.Choice[str] | None = None) -> None:
+    await inter.response.defer(thinking=True)
+    cours = await _cours_ou_erreur(inter)
+    if cours is None:
+        return
+    d = maintenant().date()
+    if quand is None and d.weekday() >= 5:
+        d += timedelta(days=2)  # le week-end, « cette semaine » = celle qui arrive
+    d += timedelta(weeks=int(quand.value) if quand else 0)
+    await inter.followup.send(embed=edt_semaine_embed(edt_mod.de_la_semaine(cours, d)))
 
 
 # ── /notes ────────────────────────────────────────────────────────────────────

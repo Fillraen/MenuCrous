@@ -6,6 +6,8 @@ Bot Discord qui :
   et **Puvis de Chavannes** dans un salon, et répond à `/menu` ;
 - prévient quand une **nouvelle note** apparaît sur Mon Dossier Web (INSA Lyon) : seulement
   le nom de la matière, jamais la note ;
+- poste l'**emploi du temps** (ADE INSA) : récap de la semaine le lundi et/ou cours du jour,
+  et prévient quand un cours des 14 prochains jours est déplacé, ajouté ou annulé ;
 - sert une petite page web des menus de la semaine (+ API JSON).
 
 Il s'installe **sur un serveur** (envois automatiques, `/config`) **et sur un compte
@@ -29,6 +31,10 @@ les desserts sous « Plat végétarien »).
 | `/menu [restaurant] [jour] [complet]` | partout | Menu d'un jour (par défaut : aujourd'hui, les deux restos, sans entrées/desserts) |
 | `/semaine [restaurant]` | partout | Les plats des prochains jours |
 | `/restaurants` | partout | Adresse, horaires, accès |
+| `/edt jour [quand]` | partout | Cours d'un jour (aujourd'hui, demain, un jour de la semaine) |
+| `/edt semaine [quand]` | partout | Cette semaine, la suivante ou dans 2 semaines |
+| `/config edt salon: mode: heure: modifs:` | serveur | EDT auto : `semaine` (le lundi), `jour` (chaque matin de cours) ou les deux ; `modifs` = alertes de changements |
+| `/config edt-stop` | serveur | Coupe l'EDT auto |
 | `/notes verifier` | partout | Relève les notes maintenant et annonce les nouvelles (matière seulement) |
 | `/notes statut` | partout | Dernier relevé, prochain, dernière erreur |
 | `/notes code <code>` | partout, **propriétaire** | Donne le code 2FA demandé en MP |
@@ -38,6 +44,14 @@ les desserts sous « Plat végétarien »).
 
 Les jours sans menu (week-end, fermeture), rien n'est posté. Si le bot redémarre peu après
 l'heure prévue, l'envoi est rattrapé (jusqu'à 3 h de retard).
+
+## Emploi du temps
+
+`EDT_ICS_URL` = lien iCal personnel d'ADE (`https://ade-outils.insa-lyon.fr/ADE-Cal:~login!2026-2027:<jeton>`),
+pas de connexion à faire : **le jeton est dans l'URL, à garder secret**. Le flux est relu
+(cache 30 min) ; toutes les 30 min entre 7 h et 23 h, les cours des 14 prochains jours sont
+comparés au relevé précédent (horaire, salle, intitulé) et les changements annoncés. Une
+semaine sans cours est affichée « période en entreprise ».
 
 ## Notes INSA
 
